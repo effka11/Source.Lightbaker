@@ -55,9 +55,19 @@ fn gm_construct_opens_and_feeds_the_same_solve() {
         return;
     };
     let map = open(&path).expect("gm_construct");
-    assert!(map.luxels.len() > 500_000, "luxels {}", map.luxels.len());
+    let face_end = face_sample_end(&map);
+    assert!(face_end > 500_000, "face luxels {face_end}");
     assert!(
-        (20_000..80_000).contains(&map.triangles.len()),
+        map.luxels.len() > face_end,
+        "prop receivers {} after {face_end} faces",
+        map.luxels.len()
+    );
+    assert!(
+        !map.snapshot.props.is_empty(),
+        "static props did not become receivers"
+    );
+    assert!(
+        map.triangles.len() > 80_000 && map.triangles.len() < 200_000,
         "triangles {}",
         map.triangles.len()
     );
@@ -67,7 +77,8 @@ fn gm_construct_opens_and_feeds_the_same_solve() {
         std::fs::metadata(&path).unwrap().len() as usize
     );
 
-    let floor = nearest(&map.luxels, Vec3::new(823.0, -32.0, -144.0));
+    let faces = &map.luxels[..face_end];
+    let floor = nearest(faces, Vec3::new(823.0, -32.0, -144.0));
     assert_eq!(
         floor.receiver.role,
         Role::Floor,
@@ -82,7 +93,7 @@ fn gm_construct_opens_and_feeds_the_same_solve() {
     assert!(floor.receiver.albedo.length_squared() > 0.01);
     assert!(floor.receiver.albedo.max_element() <= 1.0);
 
-    let hill = nearest_xy(&map.luxels, -3360.0, 3430.0);
+    let hill = nearest_xy(faces, -3360.0, 3430.0);
     assert!(
         hill.receiver.position.z > -135.0,
         "displacement stayed on the base plane at {}",
@@ -90,7 +101,7 @@ fn gm_construct_opens_and_feeds_the_same_solve() {
     );
 
     let anchor = Vec3::new(823.0, -32.0, -100.0);
-    let mut order: Vec<usize> = (0..map.luxels.len()).collect();
+    let mut order: Vec<usize> = (0..face_end).collect();
     order.sort_by(|&left, &right| {
         let dl = (map.luxels[left].receiver.position - anchor).length_squared();
         let dr = (map.luxels[right].receiver.position - anchor).length_squared();
@@ -113,6 +124,15 @@ fn gm_construct_opens_and_feeds_the_same_solve() {
     let twice = solve(&map.triangles, &receivers, &[area], 16);
     assert_eq!(once, twice);
     assert!(once.light.iter().any(|color| color[0] > 0.0));
+}
+
+fn face_sample_end(map: &crate::Map) -> usize {
+    map.snapshot
+        .faces
+        .iter()
+        .map(|face| face.first_luxel as usize + face.luxel_count as usize)
+        .max()
+        .unwrap_or(0)
 }
 
 fn nearest(luxels: &[crate::Luxel], point: Vec3) -> &crate::Luxel {
@@ -166,6 +186,10 @@ fn wall_pak() -> Vec<u8> {
 
 /// A 32×32 floor and a wall. `light_offset` -1 means the file has no luxel grid.
 fn room_bsp(light_offset: i32, pak: Vec<u8>) -> Vec<u8> {
+    room_bin(light_offset, pak).finish()
+}
+
+fn room_bin(light_offset: i32, pak: Vec<u8>) -> Bin {
     let mut bin = Bin::default();
     bin.lump(1, pack([plane(Vec3::Z, 0.0), plane(Vec3::Y, 0.0)]));
     bin.lump(
@@ -227,7 +251,7 @@ fn room_bsp(light_offset: i32, pak: Vec<u8>) -> Vec<u8> {
     bin.lump(53, vec![0u8; 32]);
     bin.lump(40, pak);
     bin.lump(14, model());
-    bin.finish()
+    bin
 }
 
 fn plane(normal: Vec3, dist: f32) -> [u8; 20] {
@@ -324,3 +348,4 @@ impl Bin {
         out
     }
 }
+

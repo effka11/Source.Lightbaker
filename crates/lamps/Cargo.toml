@@ -3,6 +3,8 @@ name = "lamps"
 version = "0.1.0"
 edition = "2021"
 publish = false
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
 glam = "0.29"

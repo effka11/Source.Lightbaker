@@ -1,9 +1,13 @@
-//! Opens a Source 1 BSP: world triangles, face luxels, and a snapshot for writing.
-//! Props are not receivers and do not block rays yet.
+//! Opens a Source 1 BSP: world triangles, face luxels, model triangles, and a
+//! snapshot for writing. A prop with its own lightmap adds luxels; one without
+//! adds vertices. Both block rays.
 
 mod bsp;
 mod disp;
 mod pak;
+mod props;
+mod studio;
+mod vpk;
 
 #[cfg(test)]
 mod tests;
@@ -81,6 +85,58 @@ pub struct Snapshot {
     pub lighting: Span,
     pub lighting_hdr: Span,
     pub faces: Vec<FaceLight>,
+    pub props: Vec<PropLight>,
+}
+
+/// Prop light that replaces one pair of files inside the copied pak.
+/// Samples are contiguous in the light array, starting at `first`.
+#[derive(Clone, Debug)]
+pub struct PropLight {
+    pub ldr: String,
+    pub hdr: String,
+    pub checksum: u32,
+    pub first: u32,
+    pub body: PropBody,
+}
+
+#[derive(Clone, Debug)]
+pub enum PropBody {
+    /// One image per mesh, each `width * height` samples, in file order.
+    Luxels {
+        width: u32,
+        height: u32,
+        lods: Vec<u32>,
+        ldr_format: u32,
+        hdr_format: u32,
+    },
+    Vertices {
+        meshes: Vec<PropVerts>,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PropVerts {
+    pub lod: u32,
+    pub count: u32,
+}
+
+impl PropLight {
+    pub fn samples(&self) -> usize {
+        match &self.body {
+            PropBody::Luxels {
+                width,
+                height,
+                lods,
+                ..
+            } => (*width as usize)
+                .saturating_mul(*height as usize)
+                .saturating_mul(lods.len()),
+            PropBody::Vertices { meshes } => meshes
+                .iter()
+                .map(|mesh| mesh.count as usize)
+                .fold(0usize, usize::saturating_add),
+        }
+    }
 }
 
 pub struct Map {
@@ -94,15 +150,21 @@ pub fn open(path: impl AsRef<Path>) -> Result<Map, Error> {
     let path = path.as_ref();
     let bytes = fs::read(path)?;
     let assembled = bsp::assemble(&bytes)?;
+    let placed = props::place(&bytes, path, assembled.luxels.len() as u32);
+    let mut triangles = assembled.triangles;
+    let mut luxels = assembled.luxels;
+    triangles.extend(placed.triangles);
+    luxels.extend(placed.luxels);
     Ok(Map {
         path: path.to_path_buf(),
-        triangles: assembled.triangles,
-        luxels: assembled.luxels,
+        triangles,
+        luxels,
         snapshot: Snapshot {
             bytes,
             lighting: assembled.lighting,
             lighting_hdr: assembled.lighting_hdr,
             faces: assembled.faces,
+            props: placed.props,
         },
     })
 }

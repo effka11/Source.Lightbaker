@@ -16,7 +16,9 @@ const EXPOSURE: f32 = 0.75;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([1280.0, 800.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 800.0])
+            .with_fullscreen(true),
         ..Default::default()
     };
     eframe::run_native(
@@ -58,6 +60,22 @@ impl Camera {
             pitch.sin(),
         );
         self.target + offset * self.distance
+    }
+
+    /// Slides the orbit point across the floor. `forward` and `strafe` are -1, 0, or 1.
+    fn translate(&mut self, forward: f32, strafe: f32, dt: f32) -> bool {
+        if dt <= 0.0 || (forward == 0.0 && strafe == 0.0) {
+            return false;
+        }
+        let ahead = Vec3::new(-self.yaw.sin(), -self.yaw.cos(), 0.0);
+        let right = Vec3::new(-self.yaw.cos(), self.yaw.sin(), 0.0);
+        let step = (ahead * forward + right * strafe).normalize_or_zero();
+        if step == Vec3::ZERO {
+            return false;
+        }
+        let speed = (self.distance * 1.2).clamp(80.0, 4_000.0);
+        self.target += step * speed * dt.min(0.1);
+        true
     }
 
     fn view_proj(&self, aspect: f32) -> [[f32; 4]; 4] {
@@ -305,6 +323,32 @@ impl Lightbaker {
         }
     }
 
+    fn drive_camera(&mut self, ctx: &egui::Context) {
+        if self.error.is_some() || ctx.wants_keyboard_input() {
+            return;
+        }
+        let (forward, strafe, dt) = ctx.input(|input| {
+            let mut forward = 0.0;
+            let mut strafe = 0.0;
+            if input.key_down(egui::Key::W) {
+                forward += 1.0;
+            }
+            if input.key_down(egui::Key::S) {
+                forward -= 1.0;
+            }
+            if input.key_down(egui::Key::D) {
+                strafe += 1.0;
+            }
+            if input.key_down(egui::Key::A) {
+                strafe -= 1.0;
+            }
+            (forward, strafe, input.stable_dt)
+        });
+        if self.camera.translate(forward, strafe, dt) {
+            ctx.request_repaint();
+        }
+    }
+
     fn mesh(&mut self) -> Arc<Vec<gpu::Vertex>> {
         if self.mesh.is_none() {
             self.mesh = Some(Arc::new(self.build_vertices()));
@@ -340,6 +384,7 @@ impl Lightbaker {
 impl eframe::App for Lightbaker {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_bake();
+        self.drive_camera(ctx);
         if self.bake_rx.is_some() {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
@@ -552,6 +597,44 @@ fn push_disk(vertices: &mut Vec<gpu::Vertex>, disk: &Disk, color: [f32; 3]) {
 fn push_quad(vertices: &mut Vec<gpu::Vertex>, corners: [Vec3; 4], color: [f32; 3]) {
     push_triangle(vertices, [corners[0], corners[1], corners[2]], color);
     push_triangle(vertices, [corners[0], corners[2], corners[3]], color);
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::Vec3;
+
+    use super::Camera;
+
+    fn camera(yaw: f32) -> Camera {
+        Camera {
+            yaw,
+            pitch: 0.0,
+            distance: 100.0,
+            target: Vec3::ZERO,
+        }
+    }
+
+    #[test]
+    fn wasd_slides_across_the_floor_toward_the_view() {
+        let speed = 120.0;
+        let dt = 0.05;
+        let mut view = camera(0.0);
+        assert!(view.translate(1.0, 0.0, dt));
+        assert!((view.target - Vec3::new(0.0, -speed * dt, 0.0)).length() < 1.0e-3);
+
+        let mut view = camera(0.0);
+        view.translate(0.0, 1.0, dt);
+        assert!((view.target - Vec3::new(-speed * dt, 0.0, 0.0)).length() < 1.0e-3);
+
+        let mut view = camera(0.0);
+        view.translate(1.0, 1.0, 1.0);
+        assert!((view.target.length() - speed * 0.1).abs() < 1.0e-3);
+        assert_eq!(view.target.z, 0.0);
+
+        let mut view = camera(0.0);
+        assert!(!view.translate(0.0, 0.0, 1.0));
+        assert_eq!(view.target, Vec3::ZERO);
+    }
 }
 
 fn push_triangle(vertices: &mut Vec<gpu::Vertex>, corners: [Vec3; 3], color: [f32; 3]) {

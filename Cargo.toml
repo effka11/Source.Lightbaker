@@ -8,3 +8,7 @@ members = [
     "crates/write",
     "crates/bake",
 ]
+
+[workspace.package]
+authors = ["Egor Ozerskikh"]
+license = "AGPL-3.0-only"

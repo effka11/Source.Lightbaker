@@ -412,6 +412,7 @@ dependencies = [
  "map",
  "solve",
  "write",
+ "zip",
 ]
 
 [[package]]

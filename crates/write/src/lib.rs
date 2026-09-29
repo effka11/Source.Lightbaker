@@ -1,6 +1,9 @@
-//! Puts linear face light into a new BSP. The source path is refused.
-//! LDR and HDR are two copies of that light, style 0 only. The pak is copied
-//! unchanged, so prop light in it stays the previous record.
+//! Puts linear light into a new BSP. The source path is refused.
+//! LDR and HDR are two packings of that light, style 0 only.
+//! Face light replaces the lighting lumps. Prop light replaces luxel and
+//! vertex records inside the copied pak; models and materials stay byte for byte.
+
+mod propfile;
 
 #[cfg(test)]
 mod tests;
@@ -8,13 +11,14 @@ mod tests;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use map::{FaceLight, Snapshot};
+use map::{FaceLight, PropLight, Snapshot};
 
 const LUMPS: usize = 64;
 const HEADER: usize = 8 + LUMPS * 16 + 4;
 const FACE: usize = 56;
 const FACES: usize = 7;
 const LIGHTING: usize = 8;
+const PAKFILE: usize = 40;
 const LIGHTING_HDR: usize = 53;
 /// Flat sample plus the three bump directions Source already stored.
 const BUMP_SLOTS: usize = 4;
@@ -97,8 +101,20 @@ fn assemble(snapshot: &Snapshot, light: &[[f32; 3]]) -> Result<Vec<u8>, Error> {
         return Err(Error::NotAMap);
     }
 
+    let face_end = snapshot
+        .faces
+        .iter()
+        .map(|face| face.first_luxel as usize + face.luxel_count as usize)
+        .max()
+        .unwrap_or(0);
+    if !light_spans(&snapshot.props, face_end, light.len()) {
+        return Err(Error::Light);
+    }
     let (lighting, patches) = paint(&snapshot.faces, light)?;
     apply_faces(&mut lumps[FACES].data, &patches);
+    if !snapshot.props.is_empty() {
+        lumps[PAKFILE].data = propfile::repack(&lumps[PAKFILE].data, &snapshot.props, light)?;
+    }
     if lumps[LIGHTING_HDR].data.is_empty() {
         lumps[LIGHTING_HDR].version = lumps[LIGHTING].version;
         lumps[LIGHTING_HDR].fourcc = lumps[LIGHTING].fourcc;
@@ -125,7 +141,7 @@ fn paint(faces: &[FaceLight], light: &[[f32; 3]]) -> Result<(Vec<u8>, Vec<Patch>
         .map(|face| face.first_luxel + face.luxel_count)
         .max()
         .unwrap_or(0) as usize;
-    if covered != light.len() {
+    if covered > light.len() {
         return Err(Error::Light);
     }
 
@@ -165,6 +181,17 @@ fn paint(faces: &[FaceLight], light: &[[f32; 3]]) -> Result<(Vec<u8>, Vec<Patch>
         patches.push(Patch::Lit(offset));
     }
     Ok((bytes, patches))
+}
+
+fn light_spans(props: &[PropLight], face_end: usize, len: usize) -> bool {
+    let mut cursor = face_end;
+    for prop in props {
+        if prop.first as usize != cursor {
+            return false;
+        }
+        cursor = cursor.saturating_add(prop.samples());
+    }
+    cursor == len
 }
 
 fn grid_samples(face: &FaceLight) -> Result<usize, Error> {

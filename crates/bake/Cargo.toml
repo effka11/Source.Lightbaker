@@ -3,6 +3,8 @@ name = "bake"
 version = "0.1.0"
 edition = "2021"
 publish = false
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
 solve = { path = "../solve" }
@@ -11,3 +13,4 @@ map = { path = "../map" }
 
 [dev-dependencies]
 glam = "0.29"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
