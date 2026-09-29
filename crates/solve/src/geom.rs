@@ -5,10 +5,19 @@ pub struct Triangle {
     pub vertices: [Vec3; 3],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Wall,
+    Floor,
+    Other,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Receiver {
     pub position: Vec3,
     pub normal: Vec3,
+    pub albedo: Vec3,
+    pub role: Role,
 }
 
 /// One-sided rectangle. `half_u` and `half_v` run from the center to the edges.
@@ -22,13 +31,6 @@ pub struct Rectangle {
 }
 
 impl Rectangle {
-    pub fn translated_xy(self, x: f32, y: f32) -> Self {
-        let mut next = self;
-        next.center.x = x;
-        next.center.y = y;
-        next
-    }
-
     pub fn corners(self) -> [Vec3; 4] {
         let center = self.center;
         [

@@ -53,6 +53,7 @@ struct Lightbaker {
     x: f32,
     y: f32,
     colors: Vec<[f32; 3]>,
+    sealed: Vec<usize>,
     solves: u32,
     camera: Camera,
 }
@@ -61,13 +62,14 @@ impl Lightbaker {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         gpu::init(cc);
         let fixture = room();
-        let x = fixture.area.center.x;
-        let y = fixture.area.center.y;
+        let x = fixture.areas[0].center.x;
+        let y = fixture.areas[0].center.y;
         let mut app = Self {
             room: fixture,
             x,
             y,
             colors: Vec::new(),
+            sealed: Vec::new(),
             solves: 0,
             camera: Camera {
                 yaw: 0.7,
@@ -80,8 +82,11 @@ impl Lightbaker {
         app
     }
 
-    fn area(&self) -> Rectangle {
-        self.room.area.translated_xy(self.x, self.y)
+    fn areas(&self) -> Vec<Rectangle> {
+        let mut areas = self.room.areas.clone();
+        areas[0].center.x = self.x;
+        areas[0].center.y = self.y;
+        areas
     }
 
     fn resolve(&mut self) {
@@ -91,7 +96,14 @@ impl Lightbaker {
             .iter()
             .map(|luxel| luxel.receiver)
             .collect();
-        self.colors = solve(&self.room.triangles, &receivers, &self.area(), PREVIEW_RAYS);
+        let solved = solve(
+            &self.room.triangles,
+            &receivers,
+            &self.areas(),
+            PREVIEW_RAYS,
+        );
+        self.colors = solved.light;
+        self.sealed = solved.sealed;
         self.solves += 1;
     }
 
@@ -100,10 +112,25 @@ impl Lightbaker {
         for (luxel, color) in self.room.luxels.iter().zip(&self.colors) {
             push_quad(&mut vertices, luxel.corners, display_color(*color));
         }
-        for triangle in &self.room.panel {
-            push_triangle(&mut vertices, triangle.vertices, [0.35, 0.38, 0.42]);
+        for triangle in &self.room.grate {
+            push_triangle(&mut vertices, triangle.vertices, [0.34, 0.36, 0.4]);
         }
-        push_quad(&mut vertices, self.area().corners(), [1.0, 0.72, 0.3]);
+        for triangle in &self.room.shell {
+            let normal = (triangle.vertices[1] - triangle.vertices[0])
+                .cross(triangle.vertices[2] - triangle.vertices[0]);
+            if normal.z.abs() > normal.length() * 0.9 {
+                continue;
+            }
+            push_triangle(&mut vertices, triangle.vertices, [0.55, 0.24, 0.2]);
+        }
+        for (index, area) in self.areas().iter().enumerate() {
+            let color = if self.sealed.contains(&index) {
+                [0.86, 0.28, 0.22]
+            } else {
+                [1.0, 0.72, 0.3]
+            };
+            push_quad(&mut vertices, area.corners(), color);
+        }
         vertices
     }
 }
@@ -112,9 +139,9 @@ impl eframe::App for Lightbaker {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::SidePanel::left("controls")
             .resizable(false)
-            .exact_width(220.0)
+            .exact_width(260.0)
             .show(ctx, |ui| {
-                ui.heading("Площадка");
+                ui.heading("Первая площадка");
                 let x_changed = ui
                     .add(egui::Slider::new(&mut self.x, 40.0..=216.0).text("X"))
                     .changed();
@@ -123,6 +150,19 @@ impl eframe::App for Lightbaker {
                     .changed();
                 if x_changed || y_changed {
                     self.resolve();
+                }
+                ui.separator();
+                ui.label("Площадки");
+                for (index, _) in self.areas().iter().enumerate() {
+                    let number = index + 1;
+                    if self.sealed.contains(&index) {
+                        ui.label(
+                            egui::RichText::new(format!("{number} — глухая оболочка"))
+                                .color(egui::Color32::from_rgb(214, 96, 78)),
+                        );
+                    } else {
+                        ui.label(format!("{number} — светит"));
+                    }
                 }
                 ui.label(format!("Лучей: {PREVIEW_RAYS}"));
                 ui.label(format!("Расчётов: {}", self.solves));

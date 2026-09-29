@@ -114,9 +114,17 @@ fn check(device: Device) {
     panic!("Embree error {code}: {}", message.to_string_lossy());
 }
 
+pub(crate) struct Hit {
+    pub point: Vec3,
+    pub normal: Vec3,
+    pub distance: f32,
+    pub prim: usize,
+}
+
 /// Committed triangle scene. `rtcIntersect1` is safe to call from many threads.
 pub struct Scene {
     scene: ScenePtr,
+    triangles: Vec<Triangle>,
     _vertices: Vec<f32>,
     _indices: Vec<u32>,
 }
@@ -177,14 +185,19 @@ impl Scene {
 
         Self {
             scene,
+            triangles: triangles.to_vec(),
             _vertices: vertices,
             _indices: indices,
         }
     }
 
     pub fn occluded(&self, origin: Vec3, direction: Vec3, tfar: f32) -> bool {
-        if tfar <= 0.0 {
-            return false;
+        self.hit(origin, direction, tfar).is_some()
+    }
+
+    pub(crate) fn hit(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<Hit> {
+        if max_distance <= 0.0 || self.triangles.is_empty() {
+            return None;
         }
         let mut ray = RayHit {
             org_x: origin.x,
@@ -195,7 +208,7 @@ impl Scene {
             dir_y: direction.y,
             dir_z: direction.z,
             time: 0.0,
-            tfar,
+            tfar: max_distance,
             mask: u32::MAX,
             id: 0,
             flags: 0,
@@ -211,7 +224,24 @@ impl Scene {
             _pad: [0, 0, 0],
         };
         unsafe { rtcIntersect1(self.scene, &mut ray, std::ptr::null_mut()) };
-        ray.geom_id != INVALID_GEOMETRY
+        if ray.geom_id == INVALID_GEOMETRY {
+            return None;
+        }
+        let prim = ray.prim_id as usize;
+        let tri = self.triangles.get(prim)?;
+        let mut normal = (tri.vertices[1] - tri.vertices[0])
+            .cross(tri.vertices[2] - tri.vertices[0])
+            .normalize_or_zero();
+        if normal.dot(direction) > 0.0 {
+            normal = -normal;
+        }
+        let distance = ray.tfar;
+        Some(Hit {
+            point: origin + direction * distance,
+            normal,
+            distance,
+            prim,
+        })
     }
 }
 

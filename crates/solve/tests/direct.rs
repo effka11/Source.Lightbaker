@@ -1,5 +1,5 @@
 use glam::Vec3;
-use solve::{solve, Receiver, Rectangle};
+use solve::{solve, Receiver, Rectangle, Role};
 
 fn ceiling_light() -> Rectangle {
     Rectangle {
@@ -15,6 +15,8 @@ fn upward(position: Vec3) -> Receiver {
     Receiver {
         position,
         normal: Vec3::Z,
+        albedo: Vec3::ZERO,
+        role: Role::Other,
     }
 }
 
@@ -33,12 +35,21 @@ fn quad(z: f32, x0: f32, x1: f32, y0: f32, y1: f32) -> Vec<solve::Triangle> {
     ]
 }
 
+fn light(
+    triangles: &[solve::Triangle],
+    receivers: &[Receiver],
+    area: &Rectangle,
+    rays: u32,
+) -> Vec<[f32; 3]> {
+    solve(triangles, receivers, &[*area], rays).light
+}
+
 #[test]
 fn far_receiver_follows_nearest_point() {
     let area = ceiling_light();
     let near = upward(Vec3::ZERO);
     let far = upward(Vec3::new(9.0, 0.0, 0.0));
-    let colors = solve(&[], &[near, far], &area, 16);
+    let colors = light(&[], &[near, far], &area, 16);
     let ratio = colors[1][0] / colors[0][0];
     let expected = 100.0 / 116.0;
     assert!(
@@ -59,13 +70,13 @@ fn visibility_is_open_closed_or_partial() {
     };
     let receiver = upward(Vec3::ZERO);
 
-    let open = solve(&[], &[receiver], &area, 16);
+    let open = light(&[], &[receiver], &area, 16);
     assert!((open[0][0] - 1.0).abs() < 1.0e-4, "{}", open[0][0]);
 
-    let closed = solve(&quad(5.0, -20.0, 20.0, -20.0, 20.0), &[receiver], &area, 16);
+    let closed = light(&quad(5.0, -20.0, 20.0, -20.0, 20.0), &[receiver], &area, 16);
     assert_eq!(closed[0], [0.0, 0.0, 0.0]);
 
-    let partial = solve(&quad(5.0, 0.0, 20.0, -20.0, 20.0), &[receiver], &area, 16);
+    let partial = light(&quad(5.0, 0.0, 20.0, -20.0, 20.0), &[receiver], &area, 16);
     let visibility = partial[0][0];
     assert!(
         (0.2..0.8).contains(&visibility),
@@ -78,8 +89,8 @@ fn same_input_is_bitwise_equal() {
     let area = ceiling_light();
     let receiver = upward(Vec3::new(3.0, 0.5, 0.0));
     let blocker = quad(4.0, 0.0, 2.0, -2.0, 2.0);
-    let first = solve(&blocker, &[receiver], &area, 32);
-    let second = solve(&blocker, &[receiver], &area, 32);
+    let first = solve(&blocker, &[receiver], &[area], 32);
+    let second = solve(&blocker, &[receiver], &[area], 32);
     assert_eq!(first, second);
 }
 
@@ -87,7 +98,7 @@ fn same_input_is_bitwise_equal() {
 fn open_receiver_ignores_budget() {
     let area = ceiling_light();
     let receiver = upward(Vec3::ZERO);
-    let few = solve(&[], &[receiver], &area, 4);
-    let many = solve(&[], &[receiver], &area, 64);
+    let few = light(&[], &[receiver], &area, 4);
+    let many = light(&[], &[receiver], &area, 64);
     assert_eq!(few, many);
 }
