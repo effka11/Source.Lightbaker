@@ -7,3 +7,7 @@ publish = false
 [dependencies]
 solve = { path = "../solve" }
 write = { path = "../write" }
+map = { path = "../map" }
+
+[dev-dependencies]
+glam = "0.29"

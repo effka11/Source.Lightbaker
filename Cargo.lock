@@ -408,6 +408,8 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "bake"
 version = "0.1.0"
 dependencies = [
+ "glam",
+ "map",
  "solve",
  "write",
 ]
@@ -3245,6 +3247,7 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 name = "window"
 version = "0.1.0"
 dependencies = [
+ "bake",
  "bytemuck",
  "eframe",
  "glam",
@@ -3669,6 +3672,10 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 [[package]]
 name = "write"
 version = "0.1.0"
+dependencies = [
+ "map",
+ "zip",
+]
 
 [[package]]
 name = "writeable"

@@ -106,6 +106,10 @@ struct Lightbaker {
     mesh: Option<Arc<Vec<gpu::Vertex>>>,
     mesh_id: u64,
     camera: Camera,
+    snapshot: Option<Arc<map::Snapshot>>,
+    bake_rx: Option<mpsc::Receiver<Result<PathBuf, String>>>,
+    bake_note: Option<String>,
+    bake_failed: bool,
 }
 
 impl Lightbaker {
@@ -140,6 +144,10 @@ impl Lightbaker {
                 distance: 480.0,
                 target: Vec3::ZERO,
             },
+            snapshot: None,
+            bake_rx: None,
+            bake_note: None,
+            bake_failed: false,
         };
         match map_path().and_then(|path| {
             map::open(&path)
@@ -172,8 +180,11 @@ impl Lightbaker {
         );
         self.receivers = Arc::new(opened.luxels.iter().map(|luxel| luxel.receiver).collect());
         self.triangles = Arc::new(opened.triangles);
+        self.snapshot = Some(Arc::new(opened.snapshot));
         self.luxels = opened.luxels;
         self.path = path;
+        self.bake_note = None;
+        self.bake_failed = false;
     }
 
     fn lamp(&self) -> Lamp {
@@ -235,6 +246,65 @@ impl Lightbaker {
         }
     }
 
+    fn start_bake(&mut self) {
+        if self.bake_rx.is_some() || self.solve_rx.is_some() || self.receivers.is_empty() {
+            return;
+        }
+        let Some(snapshot) = self.snapshot.clone() else {
+            return;
+        };
+        let areas = self.areas();
+        let triangles = Arc::clone(&self.triangles);
+        let receivers = Arc::clone(&self.receivers);
+        let source = self.path.clone();
+        let destination = beside(&self.path);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = bake::bake(
+                &triangles,
+                &receivers,
+                &areas,
+                &snapshot,
+                &source,
+                &destination,
+            )
+            .map(|()| destination)
+            .map_err(|err| err.to_string());
+            let _ = tx.send(outcome);
+        });
+        self.bake_rx = Some(rx);
+        self.bake_note = None;
+        self.bake_failed = false;
+    }
+
+    fn poll_bake(&mut self) {
+        let Some(rx) = &self.bake_rx else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(path)) => {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("bsp");
+                self.bake_note = Some(format!("Записано: {name}"));
+                self.bake_failed = false;
+                self.bake_rx = None;
+            }
+            Ok(Err(err)) => {
+                self.bake_note = Some(err);
+                self.bake_failed = true;
+                self.bake_rx = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.bake_note = Some("запекание прервалось".into());
+                self.bake_failed = true;
+                self.bake_rx = None;
+            }
+        }
+    }
+
     fn mesh(&mut self) -> Arc<Vec<gpu::Vertex>> {
         if self.mesh.is_none() {
             self.mesh = Some(Arc::new(self.build_vertices()));
@@ -269,6 +339,10 @@ impl Lightbaker {
 
 impl eframe::App for Lightbaker {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_bake();
+        if self.bake_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
         match self.phase {
             Phase::Preview if self.error.is_none() => {
                 self.resolve();
@@ -299,7 +373,7 @@ impl eframe::App for Lightbaker {
                 }
                 ui.separator();
                 ui.heading("Вид");
-                let live = matches!(self.phase, Phase::Live);
+                let live = matches!(self.phase, Phase::Live) && self.bake_rx.is_none();
                 ui.add_enabled_ui(live, |ui| {
                     let mut picked = self.kind;
                     for choice in Kind::ALL {
@@ -333,6 +407,20 @@ impl eframe::App for Lightbaker {
                         ui.label(format!("{number} — из файла"));
                     } else {
                         ui.label(format!("{number} — {}", kind_name(kind)));
+                    }
+                }
+                ui.separator();
+                if ui.add_enabled(live, egui::Button::new("Запечь")).clicked() {
+                    self.start_bake();
+                }
+                if self.bake_rx.is_some() {
+                    ui.label("Запекаю…");
+                }
+                if let Some(note) = &self.bake_note {
+                    if self.bake_failed {
+                        ui.colored_label(egui::Color32::from_rgb(214, 96, 78), note);
+                    } else {
+                        ui.label(note);
                     }
                 }
                 ui.label(format!("Лучей: {PREVIEW_RAYS}"));
@@ -386,6 +474,14 @@ impl eframe::App for Lightbaker {
                 ));
         });
     }
+}
+
+fn beside(source: &std::path::Path) -> PathBuf {
+    let stem = source
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("map");
+    source.with_file_name(format!("{stem}_light.bsp"))
 }
 
 fn focus(luxels: &[Luxel]) -> Vec3 {
