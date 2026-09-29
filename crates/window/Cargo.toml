@@ -1,0 +1,13 @@
+[package]
+name = "window"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+eframe = { version = "0.32", default-features = false, features = ["accesskit", "default_fonts", "wgpu"] }
+# eframe disables wgpu's default features, so the Windows backends are named here.
+wgpu = { version = "25", default-features = false, features = ["dx12", "vulkan"] }
+glam = "0.29"
+solve = { path = "../solve" }

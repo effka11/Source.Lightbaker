@@ -1,0 +1,10 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/solve",
+    "crates/window",
+    "crates/map",
+    "crates/lamps",
+    "crates/write",
+    "crates/bake",
+]

@@ -2,7 +2,7 @@
 
 Source Lightbaker открывает собранную карту, ставит лампы площадками и записывает новый BSP рядом с исходным. Garry's Mod этот файл только загружает. Окно и запекание вызывают один расчёт: картинка в окне — тот же свет, с меньшим числом лучей.
 
-Язык модулей — в [CONTEXT.md](../CONTEXT.md). Цель — в [documents/concept.md](../documents/concept.md).
+Язык модулей — в [CONTEXT.md](../CONTEXT.md). Цель — в [documents/concept.md](../documents/concept.md). Шаги — в [documents/steps.md](steps.md).
 
 ## Модули
 
