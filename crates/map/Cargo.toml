@@ -3,3 +3,8 @@ name = "map"
 version = "0.1.0"
 edition = "2021"
 publish = false
+
+[dependencies]
+glam = "0.29"
+solve = { path = "../solve" }
+zip = { version = "2.2", default-features = false, features = ["deflate"] }

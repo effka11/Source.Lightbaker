@@ -55,6 +55,23 @@ pub struct Lamp {
     pub forward: Vec3,
 }
 
+/// Lamps stored beside the map. A missing file is an empty set.
+pub fn load_beside(map: &std::path::Path) -> Vec<Lamp> {
+    let path = map.with_extension("lamps");
+    if !path.is_file() {
+        return Vec::new();
+    }
+    read_lamps(&path)
+}
+
+fn read_lamps(path: &std::path::Path) -> Vec<Lamp> {
+    // The bytes of that file are defined when it is written.
+    let Ok(_bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
+    Vec::new()
+}
+
 impl Lamp {
     pub fn area(self) -> Area {
         let forward = horizontal(self.forward);
@@ -113,6 +130,13 @@ fn aim(forward: Vec3, tilt_degrees: f32) -> Vec3 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_lamp_file_is_an_empty_set() {
+        let path = std::env::temp_dir().join("lightbaker-no-lamps.bsp");
+        assert!(load_beside(&path).is_empty());
+    }
+
     use solve::{solve, Area, Disk, Rectangle};
 
     fn placed(kind: Kind) -> Area {

@@ -4,11 +4,11 @@ use rayon::prelude::*;
 use crate::embree::Scene;
 use crate::geom::{Area, Receiver, Role, Triangle};
 use crate::shell::sealed_areas;
+use crate::walls::WallIndex;
 
 const MIN_DISTANCE: f32 = 1.0e-2;
 pub(crate) const RAY_LIFT: f32 = 0.5;
 const HIT_SLOP: f32 = 1.0e-3;
-const PLANE_EPS: f32 = 1.5;
 const BOUNCES: u32 = 2;
 const TRACE: f32 = 1.0e6;
 /// Floors dimmer than this fraction of the bounce already in the room are lifted.
@@ -109,13 +109,8 @@ fn diffuse_bounce(
     arriving: &[[f32; 3]],
     rays: u32,
 ) -> Vec<[f32; 3]> {
-    let walls: Vec<usize> = receivers
-        .iter()
-        .enumerate()
-        .filter(|(_, receiver)| receiver.role == Role::Wall)
-        .map(|(index, _)| index)
-        .collect();
-    if walls.is_empty() {
+    let walls = WallIndex::build(receivers);
+    if !walls.any() {
         return vec![[0.0, 0.0, 0.0]; receivers.len()];
     }
     receivers
@@ -130,7 +125,7 @@ fn diffuse_bounce(
 fn bounce_one(
     scene: &Scene,
     receivers: &[Receiver],
-    walls: &[usize],
+    walls: &WallIndex,
     arriving: &[[f32; 3]],
     gather: usize,
     receiver: &Receiver,
@@ -147,45 +142,13 @@ fn bounce_one(
         let Some(hit) = scene.hit(origin, direction, TRACE) else {
             continue;
         };
-        let Some(wall) = wall_sample(receivers, walls, hit.point, hit.normal, gather) else {
+        let Some(wall) = walls.nearest(receivers, hit.point, hit.normal, gather) else {
             continue;
         };
         add_color(&mut sum, tint(receivers[wall].albedo, arriving[wall]));
     }
     let scale = rays as f32;
     sum.map(|channel| channel / scale)
-}
-
-fn wall_sample(
-    receivers: &[Receiver],
-    walls: &[usize],
-    point: Vec3,
-    hit_normal: Vec3,
-    gather: usize,
-) -> Option<usize> {
-    let mut best: Option<(usize, f32)> = None;
-    for &index in walls {
-        if index == gather {
-            continue;
-        }
-        let wall = &receivers[index];
-        let normal = wall.normal.normalize_or_zero();
-        if normal.dot(hit_normal) < 0.5 {
-            continue;
-        }
-        if (point - wall.position).dot(normal).abs() > PLANE_EPS {
-            continue;
-        }
-        let distance = point.distance_squared(wall.position);
-        let nearer = match best {
-            Some((_, best_distance)) => distance < best_distance,
-            None => true,
-        };
-        if nearer {
-            best = Some((index, distance));
-        }
-    }
-    best.map(|(index, _)| index)
 }
 
 fn lift_floors(light: &mut [[f32; 3]], direct: &[[f32; 3]], receivers: &[Receiver]) {

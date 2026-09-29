@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 
@@ -14,7 +16,8 @@ struct GpuVertex {
 }
 
 pub struct RoomCallback {
-    pub vertices: Vec<Vertex>,
+    pub vertices: Arc<Vec<Vertex>>,
+    pub mesh_id: u64,
     pub view_proj: [[f32; 4]; 4],
     pub width: u32,
     pub height: u32,
@@ -87,6 +90,8 @@ struct Gpu {
     depth: wgpu::Texture,
     blit_bind: wgpu::BindGroup,
     size: (u32, u32),
+    mesh_id: u64,
+    drawn: u32,
 }
 
 impl Gpu {
@@ -257,6 +262,8 @@ impl Gpu {
             depth,
             blit_bind,
             size: (1, 1),
+            mesh_id: u64::MAX,
+            drawn: 0,
         }
     }
 
@@ -351,23 +358,29 @@ impl egui_wgpu::CallbackTrait for RoomCallback {
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let gpu = resources.get_mut::<Gpu>().expect("room gpu resources");
+        if gpu.mesh_id != self.mesh_id {
+            gpu.drawn = self.vertices.len() as u32;
+        }
         gpu.ensure(
             device,
             self.width.max(1),
             self.height.max(1),
-            self.vertices.len(),
+            gpu.drawn.max(1) as usize,
         );
-
-        let packed: Vec<GpuVertex> = self
-            .vertices
-            .iter()
-            .map(|vertex| GpuVertex {
-                position: vertex.position,
-                color: vertex.color,
-            })
-            .collect();
-        if !packed.is_empty() {
-            queue.write_buffer(&gpu.vertices, 0, bytemuck::cast_slice(&packed));
+        if gpu.mesh_id != self.mesh_id {
+            let packed: Vec<GpuVertex> = self
+                .vertices
+                .iter()
+                .map(|vertex| GpuVertex {
+                    position: vertex.position,
+                    color: vertex.color,
+                })
+                .collect();
+            if !packed.is_empty() {
+                queue.write_buffer(&gpu.vertices, 0, bytemuck::cast_slice(&packed));
+            }
+            gpu.mesh_id = self.mesh_id;
+            gpu.drawn = packed.len() as u32;
         }
         queue.write_buffer(&gpu.uniform, 0, bytemuck::cast_slice(&self.view_proj));
 
@@ -406,7 +419,7 @@ impl egui_wgpu::CallbackTrait for RoomCallback {
             pass.set_pipeline(&gpu.scene_pipeline);
             pass.set_bind_group(0, &gpu.scene_bind, &[]);
             pass.set_vertex_buffer(0, gpu.vertices.slice(..));
-            pass.draw(0..packed.len() as u32, 0..1);
+            pass.draw(0..gpu.drawn, 0..1);
         }
         vec![encoder.finish()]
     }
