@@ -2,7 +2,7 @@ use glam::Vec3;
 use rayon::prelude::*;
 
 use crate::embree::Scene;
-use crate::geom::{Receiver, Rectangle, Role, Triangle};
+use crate::geom::{Area, Receiver, Role, Triangle};
 use crate::shell::sealed_areas;
 
 const MIN_DISTANCE: f32 = 1.0e-2;
@@ -21,12 +21,7 @@ pub struct Solved {
     pub sealed: Vec<usize>,
 }
 
-pub fn solve(
-    triangles: &[Triangle],
-    receivers: &[Receiver],
-    areas: &[Rectangle],
-    rays: u32,
-) -> Solved {
+pub fn solve(triangles: &[Triangle], receivers: &[Receiver], areas: &[Area], rays: u32) -> Solved {
     let sealed = sealed_areas(triangles, areas);
     if receivers.is_empty() {
         return Solved {
@@ -35,7 +30,7 @@ pub fn solve(
         };
     }
 
-    let open: Vec<&Rectangle> = areas
+    let open: Vec<&Area> = areas
         .iter()
         .enumerate()
         .filter(|(index, _)| !sealed.contains(index))
@@ -64,16 +59,16 @@ pub fn solve(
     Solved { light, sealed }
 }
 
-pub(crate) fn unoccluded_intensity(area: &Rectangle, position: Vec3) -> f32 {
+pub(crate) fn unoccluded_intensity(area: &Area, position: Vec3) -> f32 {
     let nearest = nearest_point(area, position);
     let distance = (nearest - position).length().max(MIN_DISTANCE);
-    area.intensity / (distance * distance)
+    area.intensity() / (distance * distance)
 }
 
 fn direct_light(
     scene: &Scene,
     receivers: &[Receiver],
-    areas: &[&Rectangle],
+    areas: &[&Area],
     rays: u32,
 ) -> Vec<[f32; 3]> {
     receivers
@@ -88,7 +83,7 @@ fn direct_light(
         .collect()
 }
 
-fn direct(scene: &Scene, receiver: &Receiver, area: &Rectangle, rays: u32) -> [f32; 3] {
+fn direct(scene: &Scene, receiver: &Receiver, area: &Area, rays: u32) -> [f32; 3] {
     let normal = receiver.normal.normalize_or_zero();
     let scale = unoccluded_intensity(area, receiver.position);
     if scale == 0.0 || normal == Vec3::ZERO {
@@ -99,12 +94,13 @@ fn direct(scene: &Scene, receiver: &Receiver, area: &Rectangle, rays: u32) -> [f
     let mut hits = 0u32;
     for index in 0..rays {
         let sample = stratum_point(area, index, rays);
-        if arrives(scene, origin, sample, normal, area.normal) {
+        if arrives(scene, origin, sample, normal, area.normal()) {
             hits += 1;
         }
     }
     let value = scale * hits as f32 / rays as f32;
-    [value, value, value]
+    let color = area.color();
+    [value * color.x, value * color.y, value * color.z]
 }
 
 fn diffuse_bounce(
@@ -240,20 +236,48 @@ fn bounce_target(
     Some(sum.map(|channel| channel / scale))
 }
 
-fn nearest_point(area: &Rectangle, point: Vec3) -> Vec3 {
-    let u_len = area.half_u.length().max(MIN_DISTANCE);
-    let v_len = area.half_v.length().max(MIN_DISTANCE);
-    let u_axis = area.half_u / u_len;
-    let v_axis = area.half_v / v_len;
-    let offset = point - area.center;
-    let du = offset.dot(u_axis).clamp(-u_len, u_len);
-    let dv = offset.dot(v_axis).clamp(-v_len, v_len);
-    area.center + u_axis * du + v_axis * dv
+fn nearest_point(area: &Area, point: Vec3) -> Vec3 {
+    match area {
+        Area::Rectangle(rectangle) => {
+            let u_len = rectangle.half_u.length().max(MIN_DISTANCE);
+            let v_len = rectangle.half_v.length().max(MIN_DISTANCE);
+            let u_axis = rectangle.half_u / u_len;
+            let v_axis = rectangle.half_v / v_len;
+            let offset = point - rectangle.center;
+            let du = offset.dot(u_axis).clamp(-u_len, u_len);
+            let dv = offset.dot(v_axis).clamp(-v_len, v_len);
+            rectangle.center + u_axis * du + v_axis * dv
+        }
+        Area::Disk(disk) => {
+            let (axis, bitangent) = disk.frame();
+            let offset = point - disk.center;
+            let du = offset.dot(axis);
+            let dv = offset.dot(bitangent);
+            let planar = (du * du + dv * dv).sqrt();
+            if planar <= disk.radius.max(0.0) || planar <= MIN_DISTANCE {
+                disk.center + axis * du + bitangent * dv
+            } else {
+                let scale = disk.radius / planar;
+                disk.center + axis * du * scale + bitangent * dv * scale
+            }
+        }
+    }
 }
 
-pub(crate) fn stratum_point(area: &Rectangle, index: u32, rays: u32) -> Vec3 {
+pub(crate) fn stratum_point(area: &Area, index: u32, rays: u32) -> Vec3 {
     let (u, v) = stratum_uv(index, rays);
-    area.center + (u * 2.0 - 1.0) * area.half_u + (v * 2.0 - 1.0) * area.half_v
+    match area {
+        Area::Rectangle(rectangle) => {
+            rectangle.center
+                + (u * 2.0 - 1.0) * rectangle.half_u
+                + (v * 2.0 - 1.0) * rectangle.half_v
+        }
+        Area::Disk(disk) => {
+            let (x, y) = concentric_disk(u, v);
+            let (axis, bitangent) = disk.frame();
+            disk.center + axis * (x * disk.radius) + bitangent * (y * disk.radius)
+        }
+    }
 }
 
 fn stratum_uv(index: u32, rays: u32) -> (f32, f32) {

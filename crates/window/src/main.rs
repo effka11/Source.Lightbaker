@@ -2,7 +2,8 @@ mod gpu;
 
 use eframe::egui::{self, Sense};
 use glam::{Mat4, Vec3};
-use solve::{room, solve, Rectangle, Room};
+use lamps::{Kind, Lamp};
+use solve::{room, solve, Area, Disk, Room};
 
 const PREVIEW_RAYS: u32 = 16;
 const EXPOSURE: f32 = 0.75;
@@ -50,6 +51,7 @@ impl Camera {
 
 struct Lightbaker {
     room: Room,
+    kind: Kind,
     x: f32,
     y: f32,
     colors: Vec<[f32; 3]>,
@@ -62,10 +64,12 @@ impl Lightbaker {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         gpu::init(cc);
         let fixture = room();
-        let x = fixture.areas[0].center.x;
-        let y = fixture.areas[0].center.y;
+        let center = fixture.areas[0].center();
+        let x = center.x;
+        let y = center.y;
         let mut app = Self {
             room: fixture,
+            kind: Kind::Fluorescent,
             x,
             y,
             colors: Vec::new(),
@@ -82,11 +86,16 @@ impl Lightbaker {
         app
     }
 
-    fn areas(&self) -> Vec<Rectangle> {
-        let mut areas = self.room.areas.clone();
-        areas[0].center.x = self.x;
-        areas[0].center.y = self.y;
-        areas
+    fn lamp(&self) -> Lamp {
+        Lamp {
+            kind: self.kind,
+            position: Vec3::new(self.x, self.y, self.kind.height()),
+            forward: Vec3::X,
+        }
+    }
+
+    fn areas(&self) -> Vec<Area> {
+        vec![self.lamp().area(), self.room.areas[1]]
     }
 
     fn resolve(&mut self) {
@@ -124,12 +133,13 @@ impl Lightbaker {
             push_triangle(&mut vertices, triangle.vertices, [0.55, 0.24, 0.2]);
         }
         for (index, area) in self.areas().iter().enumerate() {
-            let color = if self.sealed.contains(&index) {
-                [0.86, 0.28, 0.22]
-            } else {
-                [1.0, 0.72, 0.3]
-            };
-            push_quad(&mut vertices, area.corners(), color);
+            let color = marker(*area, self.sealed.contains(&index));
+            match area {
+                Area::Rectangle(rectangle) => {
+                    push_quad(&mut vertices, rectangle.corners(), color);
+                }
+                Area::Disk(disk) => push_disk(&mut vertices, disk, color),
+            }
         }
         vertices
     }
@@ -141,7 +151,15 @@ impl eframe::App for Lightbaker {
             .resizable(false)
             .exact_width(260.0)
             .show(ctx, |ui| {
-                ui.heading("Первая площадка");
+                ui.heading("Вид");
+                let mut picked = self.kind;
+                for choice in Kind::ALL {
+                    ui.selectable_value(&mut picked, choice, kind_name(choice));
+                }
+                if picked != self.kind {
+                    self.kind = picked;
+                    self.resolve();
+                }
                 let x_changed = ui
                     .add(egui::Slider::new(&mut self.x, 40.0..=216.0).text("X"))
                     .changed();
@@ -161,7 +179,7 @@ impl eframe::App for Lightbaker {
                                 .color(egui::Color32::from_rgb(214, 96, 78)),
                         );
                     } else {
-                        ui.label(format!("{number} — светит"));
+                        ui.label(format!("{number} — {}", kind_name(self.kind)));
                     }
                 }
                 ui.label(format!("Лучей: {PREVIEW_RAYS}"));
@@ -201,8 +219,37 @@ impl eframe::App for Lightbaker {
     }
 }
 
+fn kind_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Fluorescent => "Люминесцент",
+        Kind::Bulb => "Колба",
+        Kind::Sconce => "Бра",
+        Kind::Camera => "Камера",
+        Kind::Emergency => "Аварийная",
+    }
+}
+
+fn marker(area: Area, sealed: bool) -> [f32; 3] {
+    if sealed {
+        return [0.86, 0.28, 0.22];
+    }
+    (Vec3::new(1.0, 0.72, 0.3) * area.color()).to_array()
+}
+
 fn display_color(linear: [f32; 3]) -> [f32; 3] {
     linear.map(|channel| (channel * EXPOSURE).clamp(0.0, 1.0))
+}
+
+fn push_disk(vertices: &mut Vec<gpu::Vertex>, disk: &Disk, color: [f32; 3]) {
+    let (axis, bitangent) = disk.frame();
+    let steps = 16u32;
+    for step in 0..steps {
+        let a0 = step as f32 / steps as f32 * std::f32::consts::TAU;
+        let a1 = (step + 1) as f32 / steps as f32 * std::f32::consts::TAU;
+        let p0 = disk.center + (axis * a0.cos() + bitangent * a0.sin()) * disk.radius;
+        let p1 = disk.center + (axis * a1.cos() + bitangent * a1.sin()) * disk.radius;
+        push_triangle(vertices, [disk.center, p0, p1], color);
+    }
 }
 
 fn push_quad(vertices: &mut Vec<gpu::Vertex>, corners: [Vec3; 4], color: [f32; 3]) {

@@ -1,14 +1,15 @@
 use glam::Vec3;
-use solve::{solve, Receiver, Rectangle, Role};
+use solve::{solve, Area, Disk, Receiver, Rectangle, Role};
 
-fn ceiling_light() -> Rectangle {
-    Rectangle {
+fn ceiling_light() -> Area {
+    Area::Rectangle(Rectangle {
         center: Vec3::new(0.0, 0.0, 10.0),
         half_u: Vec3::new(5.0, 0.0, 0.0),
         half_v: Vec3::new(0.0, 1.0, 0.0),
         normal: -Vec3::Z,
         intensity: 100.0,
-    }
+        color: Vec3::ONE,
+    })
 }
 
 fn upward(position: Vec3) -> Receiver {
@@ -38,7 +39,7 @@ fn quad(z: f32, x0: f32, x1: f32, y0: f32, y1: f32) -> Vec<solve::Triangle> {
 fn light(
     triangles: &[solve::Triangle],
     receivers: &[Receiver],
-    area: &Rectangle,
+    area: &Area,
     rays: u32,
 ) -> Vec<[f32; 3]> {
     solve(triangles, receivers, &[*area], rays).light
@@ -61,13 +62,14 @@ fn far_receiver_follows_nearest_point() {
 
 #[test]
 fn visibility_is_open_closed_or_partial() {
-    let area = Rectangle {
+    let area = Area::Rectangle(Rectangle {
         center: Vec3::new(0.0, 0.0, 10.0),
         half_u: Vec3::new(2.0, 0.0, 0.0),
         half_v: Vec3::new(0.0, 0.5, 0.0),
         normal: -Vec3::Z,
         intensity: 100.0,
-    };
+        color: Vec3::ONE,
+    });
     let receiver = upward(Vec3::ZERO);
 
     let open = light(&[], &[receiver], &area, 16);
@@ -101,4 +103,38 @@ fn open_receiver_ignores_budget() {
     let few = light(&[], &[receiver], &area, 4);
     let many = light(&[], &[receiver], &area, 64);
     assert_eq!(few, many);
+}
+
+#[test]
+fn patch_color_scales_each_channel() {
+    let Area::Rectangle(mut rectangle) = ceiling_light() else {
+        panic!("ceiling light is a rectangle");
+    };
+    rectangle.color = Vec3::new(0.25, 0.5, 0.0);
+    let colors = light(&[], &[upward(Vec3::ZERO)], &Area::Rectangle(rectangle), 8);
+    assert!((colors[0][0] - 0.25).abs() < 1.0e-4, "{}", colors[0][0]);
+    assert!((colors[0][1] - 0.5).abs() < 1.0e-4, "{}", colors[0][1]);
+    assert_eq!(colors[0][2], 0.0);
+}
+
+#[test]
+fn disk_falls_off_from_the_rim() {
+    let disk = Area::Disk(Disk {
+        center: Vec3::new(0.0, 0.0, 10.0),
+        radius: 2.0,
+        normal: -Vec3::Z,
+        axis: Vec3::X,
+        intensity: 100.0,
+        color: Vec3::ONE,
+    });
+    let under = light(&[], &[upward(Vec3::ZERO)], &disk, 16);
+    assert!((under[0][0] - 1.0).abs() < 1.0e-4, "{}", under[0][0]);
+
+    let aside = light(&[], &[upward(Vec3::new(5.0, 0.0, 0.0))], &disk, 16);
+    let expected = 100.0 / 109.0;
+    assert!(
+        (aside[0][0] - expected).abs() < 1.0e-4,
+        "{} vs {expected}",
+        aside[0][0]
+    );
 }

@@ -1455,6 +1455,10 @@ dependencies = [
 [[package]]
 name = "lamps"
 version = "0.1.0"
+dependencies = [
+ "glam",
+ "solve",
+]
 
 [[package]]
 name = "libc"
@@ -3219,6 +3223,7 @@ dependencies = [
  "bytemuck",
  "eframe",
  "glam",
+ "lamps",
  "solve",
  "wgpu",
 ]

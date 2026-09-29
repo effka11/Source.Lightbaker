@@ -11,3 +11,4 @@ eframe = { version = "0.32", default-features = false, features = ["accesskit", 
 wgpu = { version = "25", default-features = false, features = ["dx12", "vulkan"] }
 glam = "0.29"
 solve = { path = "../solve" }
+lamps = { path = "../lamps" }

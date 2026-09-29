@@ -1,5 +1,5 @@
 use glam::Vec3;
-use solve::{solve, Receiver, Rectangle, Role, Triangle};
+use solve::{solve, Area, Receiver, Rectangle, Role, Triangle};
 
 fn other(position: Vec3, normal: Vec3) -> Receiver {
     Receiver {
@@ -70,14 +70,15 @@ fn closed_box(min: Vec3, max: Vec3) -> Vec<Triangle> {
     triangles
 }
 
-fn downward(center: Vec3, intensity: f32) -> Rectangle {
-    Rectangle {
+fn downward(center: Vec3, intensity: f32) -> Area {
+    Area::Rectangle(Rectangle {
         center,
         half_u: Vec3::new(0.6, 0.0, 0.0),
         half_v: Vec3::new(0.0, 0.6, 0.0),
         normal: -Vec3::Z,
         intensity,
-    }
+        color: Vec3::ONE,
+    })
 }
 
 #[test]
@@ -168,13 +169,14 @@ fn two_bounces_carry_the_second_wall() {
 
 #[test]
 fn grate_gap_passes_and_bar_blocks() {
-    let light = Rectangle {
+    let light = Area::Rectangle(Rectangle {
         center: Vec3::new(0.0, 0.0, 20.0),
         half_u: Vec3::new(0.4, 0.0, 0.0),
         half_v: Vec3::new(0.0, 0.4, 0.0),
         normal: -Vec3::Z,
         intensity: 100.0,
-    };
+        color: Vec3::ONE,
+    });
     let mut bars = Vec::new();
     bars.extend(quad(
         Vec3::new(-8.0, 2.0, 10.0),

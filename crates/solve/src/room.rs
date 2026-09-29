@@ -1,6 +1,6 @@
 use glam::Vec3;
 
-use crate::geom::{Receiver, Rectangle, Role, Triangle};
+use crate::geom::{Area, Receiver, Rectangle, Role, Triangle};
 
 #[cfg(test)]
 use crate::light::{solve, stratum_point, unoccluded_intensity, RAY_LIFT};
@@ -27,7 +27,7 @@ pub struct Luxel {
 pub struct Room {
     pub triangles: Vec<Triangle>,
     pub luxels: Vec<Luxel>,
-    pub areas: Vec<Rectangle>,
+    pub areas: Vec<Area>,
     pub grate: Vec<Triangle>,
     pub shell: Vec<Triangle>,
 }
@@ -125,20 +125,22 @@ pub fn room() -> Room {
         triangles,
         luxels,
         areas: vec![
-            Rectangle {
+            Area::Rectangle(Rectangle {
                 center: Vec3::new(80.0, 128.0, 118.0),
                 half_u: Vec3::new(36.0, 0.0, 0.0),
                 half_v: Vec3::new(0.0, 8.0, 0.0),
                 normal: -Vec3::Z,
                 intensity: 18_000.0,
-            },
-            Rectangle {
+                color: Vec3::ONE,
+            }),
+            Area::Rectangle(Rectangle {
                 center: Vec3::new(38.0, 42.0, 34.0),
                 half_u: Vec3::new(8.0, 0.0, 0.0),
                 half_v: Vec3::new(0.0, 6.0, 0.0),
                 normal: -Vec3::Z,
                 intensity: 18_000.0,
-            },
+                color: Vec3::ONE,
+            }),
         ],
         grate,
         shell,
@@ -489,7 +491,7 @@ mod tests {
     fn sealed_lamp_does_not_change_luxels() {
         let room = room();
         let mut receivers = receivers_of(&room);
-        let lamp = room.areas[1].center;
+        let lamp = room.areas[1].center();
         receivers.push(Receiver {
             position: Vec3::new(lamp.x, lamp.y, lamp.z - 20.0),
             normal: Vec3::Z,

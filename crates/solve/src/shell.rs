@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use glam::Vec3;
 
 use crate::embree::Scene;
-use crate::geom::{Rectangle, Triangle};
+use crate::geom::{Area, Triangle};
 
 const TRACE: f32 = 1.0e6;
 const NUDGE: f32 = 1.0e-3;
@@ -17,7 +17,7 @@ const DIRECTIONS: [Vec3; 3] = [
     Vec3::new(0.247, -0.538, 0.806),
 ];
 
-pub(crate) fn sealed_areas(triangles: &[Triangle], areas: &[Rectangle]) -> Vec<usize> {
+pub(crate) fn sealed_areas(triangles: &[Triangle], areas: &[Area]) -> Vec<usize> {
     if triangles.is_empty() || areas.is_empty() {
         return Vec::new();
     }
@@ -38,7 +38,7 @@ pub(crate) fn sealed_areas(triangles: &[Triangle], areas: &[Rectangle]) -> Vec<u
             if sealed.contains(&index) {
                 continue;
             }
-            if inside(&shell, area.center) {
+            if inside(&shell, area.center()) {
                 sealed.push(index);
             }
         }

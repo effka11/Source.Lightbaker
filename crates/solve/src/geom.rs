@@ -28,6 +28,7 @@ pub struct Rectangle {
     pub half_v: Vec3,
     pub normal: Vec3,
     pub intensity: f32,
+    pub color: Vec3,
 }
 
 impl Rectangle {
@@ -39,5 +40,71 @@ impl Rectangle {
             center + self.half_u + self.half_v,
             center - self.half_u + self.half_v,
         ]
+    }
+}
+
+/// One-sided disk. `axis` lies in the disk and fixes the sample layout.
+#[derive(Clone, Copy, Debug)]
+pub struct Disk {
+    pub center: Vec3,
+    pub radius: f32,
+    pub normal: Vec3,
+    pub axis: Vec3,
+    pub intensity: f32,
+    pub color: Vec3,
+}
+
+impl Disk {
+    /// Orthonormal axes in the disk plane: `(axis, bitangent)`.
+    pub fn frame(self) -> (Vec3, Vec3) {
+        let normal = self.normal.normalize_or_zero();
+        let mut axis = self.axis - normal * self.axis.dot(normal);
+        if axis.length_squared() <= 1.0e-8 {
+            let helper = if normal.x.abs() > 0.9 {
+                Vec3::Y
+            } else {
+                Vec3::X
+            };
+            axis = helper.cross(normal);
+        }
+        let axis = axis.normalize_or_zero();
+        (axis, normal.cross(axis))
+    }
+}
+
+/// Emitting patch handed to the solver.
+#[derive(Clone, Copy, Debug)]
+pub enum Area {
+    Rectangle(Rectangle),
+    Disk(Disk),
+}
+
+impl Area {
+    pub fn center(self) -> Vec3 {
+        match self {
+            Area::Rectangle(rectangle) => rectangle.center,
+            Area::Disk(disk) => disk.center,
+        }
+    }
+
+    pub fn normal(self) -> Vec3 {
+        match self {
+            Area::Rectangle(rectangle) => rectangle.normal,
+            Area::Disk(disk) => disk.normal,
+        }
+    }
+
+    pub fn intensity(self) -> f32 {
+        match self {
+            Area::Rectangle(rectangle) => rectangle.intensity,
+            Area::Disk(disk) => disk.intensity,
+        }
+    }
+
+    pub fn color(self) -> Vec3 {
+        match self {
+            Area::Rectangle(rectangle) => rectangle.color,
+            Area::Disk(disk) => disk.color,
+        }
     }
 }
