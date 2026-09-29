@@ -59,6 +59,39 @@ pub fn solve(triangles: &[Triangle], receivers: &[Receiver], areas: &[Area], ray
     Solved { light, sealed }
 }
 
+const SOLID_SPAN: f32 = 64.0;
+const SOLID_LIFT: f32 = 2.0;
+const SOLID_ALIGN: f32 = 0.7;
+
+/// A wall normal that steps straight into a thin solid, with open space behind
+/// the sample, faces the solid. Floors and ceilings are left as they are: a
+/// low ceiling must not turn the ground over.
+pub fn faces_solid(triangles: &[Triangle], probes: &[(Vec3, Vec3)]) -> Vec<bool> {
+    if triangles.is_empty() {
+        return vec![false; probes.len()];
+    }
+    let scene = Scene::build(triangles);
+    probes
+        .iter()
+        .map(|(position, normal)| {
+            let n = normal.normalize_or_zero();
+            if n == Vec3::ZERO || n.z.abs() >= SOLID_ALIGN {
+                return false;
+            }
+            let Some(ahead) = scene.hit(*position + n * SOLID_LIFT, n, SOLID_SPAN) else {
+                return false;
+            };
+            if ahead.normal.dot(n) > -SOLID_ALIGN {
+                return false;
+            }
+            match scene.hit(*position - n * SOLID_LIFT, -n, SOLID_SPAN) {
+                Some(behind) if behind.normal.dot(-n) <= -SOLID_ALIGN => false,
+                _ => true,
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn unoccluded_intensity(area: &Area, position: Vec3) -> f32 {
     let nearest = nearest_point(area, position);
     let distance = (nearest - position).length().max(MIN_DISTANCE);

@@ -126,6 +126,162 @@ fn gm_construct_opens_and_feeds_the_same_solve() {
     assert!(once.light.iter().any(|color| color[0] > 0.0));
 }
 
+#[test]
+fn a_wall_facing_into_its_slab_is_turned_toward_the_lamp() {
+    let mut triangles = Vec::new();
+    triangles.extend(wall_quad(0.0, 1.0));
+    triangles.extend(wall_quad(32.0, -1.0));
+    triangles.extend(wall_quad(64.0, -1.0));
+    let inward = receiver(Vec3::new(12.0, 0.0, 4.0), Vec3::Y);
+    let outward = receiver(Vec3::new(12.0, 32.0, 4.0), Vec3::Y);
+    let mut luxels = vec![
+        crate::Luxel {
+            receiver: inward,
+            corners: [Vec3::ZERO; 4],
+        },
+        crate::Luxel {
+            receiver: outward,
+            corners: [Vec3::ZERO; 4],
+        },
+    ];
+    let lamp = Area::Rectangle(Rectangle {
+        center: Vec3::new(12.0, -24.0, 20.0),
+        half_u: Vec3::new(2.0, 0.0, 0.0),
+        half_v: Vec3::new(0.0, 2.0, 0.0),
+        normal: -Vec3::Z,
+        intensity: 4_000.0,
+        color: Vec3::ONE,
+    });
+    let dark = solve(&triangles, &[inward], &[lamp], 16);
+    assert_eq!(dark.light[0], [0.0, 0.0, 0.0]);
+    crate::bsp::turn_faces(&triangles, &mut luxels, &[(0, 1), (1, 1)]);
+    assert!(
+        luxels[0].receiver.normal.y < -0.5,
+        "near side {:?}",
+        luxels[0].receiver.normal
+    );
+    assert!(
+        luxels[1].receiver.normal.y > 0.5,
+        "far side {:?}",
+        luxels[1].receiver.normal
+    );
+    let lit = solve(&triangles, &[luxels[0].receiver], &[lamp], 16);
+    assert!(lit.light[0][0] > 0.0, "{:?}", lit.light[0]);
+}
+
+#[test]
+fn a_floor_under_a_low_ceiling_keeps_facing_up() {
+    let ceiling = solve::Triangle {
+        vertices: [
+            Vec3::new(0.0, 0.0, 32.0),
+            Vec3::new(16.0, 0.0, 32.0),
+            Vec3::new(16.0, 16.0, 32.0),
+        ],
+    };
+    let mut luxels = vec![crate::Luxel {
+        receiver: receiver(Vec3::new(12.0, 4.0, 0.0), Vec3::Z),
+        corners: [Vec3::ZERO; 4],
+    }];
+    crate::bsp::turn_faces(&[ceiling], &mut luxels, &[(0, 1)]);
+    assert!(luxels[0].receiver.normal.z > 0.9);
+}
+
+#[test]
+fn construct_wall_beside_the_lamp_is_lit() {
+    let Some(path) = construct_path() else {
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let map = crate::bsp::assemble(&bytes).unwrap();
+    let wall_samples: Vec<_> = map
+        .luxels
+        .iter()
+        .filter(|luxel| {
+            let position = luxel.receiver.position;
+            (position.x - 1472.0).abs() < 80.0
+                && (position.y + 1056.0).abs() < 2.0
+                && position.z < -48.0
+                && luxel.receiver.normal.y < -0.5
+        })
+        .map(|luxel| luxel.receiver)
+        .collect();
+    assert!(!wall_samples.is_empty(), "wall facing the lamp");
+    let floor = map
+        .luxels
+        .iter()
+        .find(|luxel| {
+            let position = luxel.receiver.position;
+            (position.x - 1472.0).abs() < 16.0
+                && (position.y + 1315.0).abs() < 16.0
+                && (position.z + 144.0).abs() < 1.0
+        })
+        .map(|luxel| luxel.receiver)
+        .expect("floor under the lamp");
+    assert!(floor.normal.z > 0.7, "{:?}", floor.normal);
+    let area = Area::Rectangle(Rectangle {
+        center: Vec3::new(1472.0, -1315.45, -48.0),
+        half_u: Vec3::new(36.0, 0.0, 0.0),
+        half_v: Vec3::new(0.0, 8.0, 0.0),
+        normal: -Vec3::Z,
+        intensity: 18_000.0,
+        color: Vec3::ONE,
+    });
+    let mut receivers = wall_samples;
+    receivers.push(floor);
+    let lit = solve(&map.triangles, &receivers, &[area], 16);
+    let wall_light = &lit.light[..lit.light.len() - 1];
+    let lit_count = wall_light.iter().filter(|color| color[0] > 0.0).count();
+    let brightest = wall_light
+        .iter()
+        .map(|color| color[0])
+        .fold(0.0f32, f32::max);
+    assert!(
+        lit_count * 4 > wall_light.len() * 3,
+        "lit {lit_count} of {} brightest {brightest}",
+        wall_light.len()
+    );
+    assert!(
+        lit.light.last().unwrap()[0] > 0.0,
+        "floor {:?}",
+        lit.light.last()
+    );
+}
+
+fn wall_quad(y: f32, facing_y: f32) -> [solve::Triangle; 2] {
+    let a = Vec3::new(0.0, y, 0.0);
+    let b = Vec3::new(16.0, y, 0.0);
+    let c = Vec3::new(16.0, y, 16.0);
+    let d = Vec3::new(0.0, y, 16.0);
+    if facing_y >= 0.0 {
+        [
+            solve::Triangle {
+                vertices: [a, d, c],
+            },
+            solve::Triangle {
+                vertices: [a, c, b],
+            },
+        ]
+    } else {
+        [
+            solve::Triangle {
+                vertices: [a, b, c],
+            },
+            solve::Triangle {
+                vertices: [a, c, d],
+            },
+        ]
+    }
+}
+
+fn receiver(position: Vec3, normal: Vec3) -> solve::Receiver {
+    solve::Receiver {
+        position,
+        normal,
+        albedo: Vec3::splat(0.5),
+        role: Role::Wall,
+    }
+}
+
 fn face_sample_end(map: &crate::Map) -> usize {
     map.snapshot
         .faces
@@ -348,4 +504,3 @@ impl Bin {
         out
     }
 }
-

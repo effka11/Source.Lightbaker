@@ -149,7 +149,11 @@ fn push_group(
     let index_at = group_base as i32 + i32_at(vtx, group_base + 12)?;
     let num_strips = i32_at(vtx, group_base + 16)?;
     let strip_at = group_base as i32 + i32_at(vtx, group_base + 20)?;
-    if num_verts <= 0 || num_verts > 65_536 || num_indices <= 0 || num_strips <= 0 || num_strips > 64
+    if num_verts <= 0
+        || num_verts > 65_536
+        || num_indices <= 0
+        || num_strips <= 0
+        || num_strips > 64
     {
         return None;
     }
@@ -182,11 +186,7 @@ fn push_group(
         if flags & 0x01 != 0 {
             let mut index = 0;
             while index + 2 < count {
-                triangles.push([
-                    index_of(index)?,
-                    index_of(index + 1)?,
-                    index_of(index + 2)?,
-                ]);
+                triangles.push([index_of(index)?, index_of(index + 1)?, index_of(index + 2)?]);
                 index += 3;
             }
         } else if flags & 0x02 != 0 {

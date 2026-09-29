@@ -2,7 +2,7 @@
 //! sizes already stored on each face. Props are left out.
 
 use glam::{Mat3, Vec3};
-use solve::{Receiver, Role, Triangle};
+use solve::{faces_solid, Receiver, Role, Triangle};
 
 use crate::disp::{self, DispVert};
 use crate::pak;
@@ -185,6 +185,14 @@ pub fn assemble(data: &[u8]) -> Result<Assembled, Error> {
             luxel_count: luxels.len() as u32 - first,
         });
     }
+    turn_faces(
+        &triangles,
+        &mut luxels,
+        &slots
+            .iter()
+            .map(|face| (face.first_luxel, face.luxel_count))
+            .collect::<Vec<_>>(),
+    );
 
     if grids == 0 || luxels.is_empty() {
         return Err(Error::NoLuxelGrid);
@@ -696,6 +704,33 @@ fn role_of(normal: Vec3) -> Role {
         Role::Wall
     } else {
         Role::Other
+    }
+}
+
+/// One probe per face. A face that looks into its own slab is turned toward
+/// the open side, so a lamp in the room reaches that wall.
+pub(crate) fn turn_faces(triangles: &[Triangle], luxels: &mut [Luxel], faces: &[(u32, u32)]) {
+    let mut probes = Vec::new();
+    let mut spans = Vec::new();
+    for &(first, count) in faces {
+        if count == 0 {
+            continue;
+        }
+        let index = first as usize + count as usize / 2;
+        let receiver = &luxels[index].receiver;
+        probes.push((receiver.position, receiver.normal));
+        spans.push((first, count));
+    }
+    for (into_solid, (first, count)) in faces_solid(triangles, &probes).into_iter().zip(spans) {
+        if !into_solid {
+            continue;
+        }
+        let start = first as usize;
+        let end = start + count as usize;
+        for luxel in &mut luxels[start..end] {
+            luxel.receiver.normal = -luxel.receiver.normal;
+            luxel.receiver.role = role_of(luxel.receiver.normal);
+        }
     }
 }
 

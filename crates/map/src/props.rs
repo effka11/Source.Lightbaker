@@ -272,7 +272,8 @@ fn raster(group: &Group, width: u32, height: u32) -> Vec<Sample> {
                 let Some([a, b, c]) = barycentric(point, uvs[0], uvs[1], uvs[2]) else {
                     continue;
                 };
-                let position = verts[0].position * a + verts[1].position * b + verts[2].position * c;
+                let position =
+                    verts[0].position * a + verts[1].position * b + verts[2].position * c;
                 let normal = (verts[0].normal * a + verts[1].normal * b + verts[2].normal * c)
                     .normalize_or_zero();
                 if !position.is_finite() {
@@ -532,7 +533,10 @@ fn parse_props(version: u16, blob: &[u8]) -> Option<Vec<Static>> {
     let mut names = Vec::with_capacity(dict as usize);
     for _ in 0..dict {
         let bytes = blob.get(at..at + 128)?;
-        let end = bytes.iter().position(|byte| *byte == 0).unwrap_or(bytes.len());
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(bytes.len());
         names.push(String::from_utf8_lossy(&bytes[..end]).into_owned());
         at += 128;
     }
@@ -562,7 +566,8 @@ fn parse_props(version: u16, blob: &[u8]) -> Option<Vec<Static>> {
             let flags = u32_at(prop, 64)?;
             let width = u16_at(prop, 68)? as u32;
             let height = u16_at(prop, 70)? as u32;
-            let lightmap = (width > 0 && height > 0 && flags & NO_TEXEL == 0).then_some((width, height));
+            let lightmap =
+                (width > 0 && height > 0 && flags & NO_TEXEL == 0).then_some((width, height));
             (flags, lightmap)
         } else {
             (u8_at(prop, 31)? as u32 | NO_TEXEL, None)
@@ -589,7 +594,9 @@ fn lump<'a>(data: &'a [u8], index: usize) -> Option<&'a [u8]> {
 }
 
 fn normalize(name: &str) -> String {
-    name.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase()
+    name.replace('\\', "/")
+        .trim_start_matches('/')
+        .to_ascii_lowercase()
 }
 
 fn vec3(data: &[u8], offset: usize) -> Option<Vec3> {
