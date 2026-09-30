@@ -3,6 +3,7 @@
 //! adds vertices. Both block rays.
 
 mod bsp;
+mod cell;
 mod disp;
 mod pak;
 mod props;
@@ -13,8 +14,8 @@ mod vpk;
 mod tests;
 
 use std::fmt;
-use std::fs;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::Path;
 
 use glam::Vec3;
@@ -54,10 +55,22 @@ impl From<io::Error> for Error {
     }
 }
 
+/// One triangle of a face the game draws. Nodraw, sky, trigger, hint and skip
+/// stay in [`Map::triangles`] for rays and are left out of this list.
 #[derive(Clone, Copy, Debug)]
+pub struct Surface {
+    pub vertices: [Vec3; 3],
+    pub albedo: Vec3,
+}
+
+/// One receiver of the map plus the patch of surface it covers.
+#[derive(Clone, Debug)]
 pub struct Luxel {
     pub receiver: Receiver,
-    pub corners: [Vec3; 4],
+    /// Convex outline of the luxel on its surface, clipped to the face it
+    /// belongs to. Empty when the luxel's cell lies off the face: its light is
+    /// still written, but there is nothing to draw.
+    pub corners: Vec<Vec3>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -142,22 +155,42 @@ impl PropLight {
 pub struct Map {
     pub path: std::path::PathBuf,
     pub triangles: Vec<Triangle>,
+    pub surface: Vec<Surface>,
     pub luxels: Vec<Luxel>,
     pub snapshot: Snapshot,
 }
 
+/// Stages of [`open_reporting`]. `done` and `total` belong to that stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadPhase {
+    File = 0,
+    World = 1,
+    Packs = 2,
+    Props = 3,
+}
+
 pub fn open(path: impl AsRef<Path>) -> Result<Map, Error> {
+    open_reporting(path, &|_, _, _| {})
+}
+
+pub fn open_reporting(
+    path: impl AsRef<Path>,
+    report: &(dyn Fn(LoadPhase, u64, u64) + Sync),
+) -> Result<Map, Error> {
     let path = path.as_ref();
-    let bytes = fs::read(path)?;
-    let assembled = bsp::assemble(&bytes)?;
-    let placed = props::place(&bytes, path, assembled.luxels.len() as u32);
+    let bytes = read_reported(path, report)?;
+    let assembled = bsp::assemble_reporting(&bytes, report)?;
+    let placed = props::place_reporting(&bytes, path, assembled.luxels.len() as u32, report);
     let mut triangles = assembled.triangles;
+    let mut surface = assembled.surface;
     let mut luxels = assembled.luxels;
     triangles.extend(placed.triangles);
+    surface.extend(placed.surface);
     luxels.extend(placed.luxels);
     Ok(Map {
         path: path.to_path_buf(),
         triangles,
+        surface,
         luxels,
         snapshot: Snapshot {
             bytes,
@@ -167,4 +200,27 @@ pub fn open(path: impl AsRef<Path>) -> Result<Map, Error> {
             props: placed.props,
         },
     })
+}
+
+fn read_reported(
+    path: &Path,
+    report: &(dyn Fn(LoadPhase, u64, u64) + Sync),
+) -> Result<Vec<u8>, Error> {
+    let mut file = File::open(path)?;
+    let total = file.metadata().map(|meta| meta.len()).unwrap_or(0).max(1);
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 256 * 1024];
+    let mut done = 0u64;
+    report(LoadPhase::File, 0, total);
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..read]);
+        done += read as u64;
+        report(LoadPhase::File, done.min(total), total);
+    }
+    report(LoadPhase::File, total, total);
+    Ok(bytes)
 }

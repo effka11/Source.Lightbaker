@@ -154,6 +154,33 @@ fn the_neighbor_replaces_face_light_and_leaves_the_source() {
     }
 }
 
+#[test]
+fn hdr_faces_follow_the_new_lighting() {
+    let dir = scratch("hdr-faces");
+    let source = dir.join("room.bsp");
+    let dest = dir.join("room_light.bsp");
+    std::fs::write(&source, fixture_with_stale_hdr_faces()).unwrap();
+    let map = map::open(&source).unwrap();
+    let light = vec![[0.2, 0.3, 0.4]; map.luxels.len()];
+    write(&map.snapshot, &light, &source, &dest).unwrap();
+    let written = std::fs::read(&dest).unwrap();
+    let ldr = lump(&written, 7);
+    let hdr = lump(&written, 58);
+    let lighting = lump(&written, 53);
+    assert_eq!(ldr.len(), hdr.len());
+    assert_eq!(f32::from_le_bytes(hdr[24..28].try_into().unwrap()), 7.0);
+    for index in 0..ldr.len() / 56 {
+        let start = index * 56;
+        let ldr_face = &ldr[start..start + 56];
+        let hdr_face = &hdr[start..start + 56];
+        assert_eq!(&ldr_face[16..24], &hdr_face[16..24]);
+        let lightofs = i32::from_le_bytes(hdr_face[20..24].try_into().unwrap());
+        if lightofs >= 0 {
+            assert!((lightofs as usize) < lighting.len());
+        }
+    }
+}
+
 fn sample(bytes: &[u8], at: usize) -> [f32; 3] {
     unpack(bytes[at..at + 4].try_into().unwrap())
 }
@@ -237,6 +264,14 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 fn fixture() -> Vec<u8> {
+    room(None)
+}
+
+fn fixture_with_stale_hdr_faces() -> Vec<u8> {
+    room(Some(100_000))
+}
+
+fn room(stale_hdr_light: Option<i32>) -> Vec<u8> {
     let mut bin = Bin::default();
     bin.lump(
         0,
@@ -282,7 +317,17 @@ fn fixture() -> Vec<u8> {
     bin.lump(13, surf);
     let mut wall = face(1, 4, 1, 16);
     wall[17] = 4;
-    bin.lump_meta(7, pack([face(0, 0, 0, 0), wall, unlit_face()]), 1, [0; 4]);
+    let faces = pack([face(0, 0, 0, 0), wall, unlit_face()]);
+    bin.lump_meta(7, faces.clone(), 1, [0; 4]);
+    if let Some(stale) = stale_hdr_light {
+        let mut hdr = faces;
+        for index in 0..2 {
+            let at = index * 56;
+            hdr[at + 20..at + 24].copy_from_slice(&stale.to_le_bytes());
+        }
+        hdr[24..28].copy_from_slice(&7.0f32.to_le_bytes());
+        bin.lump_meta(58, hdr, 1, [0; 4]);
+    }
     let floor_tex = texinfo([1.0 / 16.0, 0.0, 0.0, 0.0], [0.0, 1.0 / 16.0, 0.0, 0.0], 0);
     let mut wall_tex = texinfo([1.0 / 16.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0 / 16.0, 0.0], 1);
     wall_tex[64..68].copy_from_slice(&0x800i32.to_le_bytes());

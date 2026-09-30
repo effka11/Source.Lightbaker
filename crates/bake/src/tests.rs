@@ -200,7 +200,11 @@ fn grate_blocks_a_stripe_and_prop_light_replaces_only_the_pak() {
         if index == 7 || index == 8 || index == 40 || index == 53 {
             continue;
         }
-        assert_eq!(lump(&original, index), lump(&written, index), "lump {index}");
+        assert_eq!(
+            lump(&original, index),
+            lump(&written, index),
+            "lump {index}"
+        );
     }
     let faces = lump(&original, 7).len() / 56;
     for index in 0..faces {
@@ -221,10 +225,18 @@ fn grate_blocks_a_stripe_and_prop_light_replaces_only_the_pak() {
             continue;
         }
         assert_eq!(zip_raw(old_pak, name), zip_raw(new_pak, name), "{name}");
-        assert_eq!(zip_bytes(new_pak, name).as_slice(), bytes.as_slice(), "{name}");
+        assert_eq!(
+            zip_bytes(new_pak, name).as_slice(),
+            bytes.as_slice(),
+            "{name}"
+        );
     }
-    assert!(!new_pak.windows(15).any(|window| window == b"OLD-GRATE-LIGHT"));
-    assert!(!new_pak.windows(14).any(|window| window == b"OLD-CARD-LIGHT"));
+    assert!(!new_pak
+        .windows(15)
+        .any(|window| window == b"OLD-GRATE-LIGHT"));
+    assert!(!new_pak
+        .windows(14)
+        .any(|window| window == b"OLD-CARD-LIGHT"));
 
     let ldr_vhv = zip_bytes(new_pak, "sp_0.vhv");
     let hdr_vhv = zip_bytes(new_pak, "sp_hdr_0.vhv");
@@ -292,10 +304,7 @@ fn scratch() -> PathBuf {
 }
 
 fn scratch_named(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "lightbaker-bake-{}-{name}",
-        std::process::id()
-    ));
+    let dir = std::env::temp_dir().join(format!("lightbaker-bake-{}-{name}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir

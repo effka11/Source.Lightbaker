@@ -1,7 +1,7 @@
 //! A lamp inside a closed shell lights nothing outside that shell.
 //! The room around a lamp is not such a shell: nothing sits outside it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use glam::Vec3;
 
@@ -10,6 +10,8 @@ use crate::geom::{Area, Triangle};
 
 const TRACE: f32 = 1.0e6;
 const NUDGE: f32 = 1.0e-3;
+/// Fewer triangles cannot close a volume.
+const MIN_SHELL: usize = 4;
 
 const DIRECTIONS: [Vec3; 3] = [
     Vec3::new(0.820, 0.431, 0.377),
@@ -23,15 +25,13 @@ pub(crate) fn sealed_areas(triangles: &[Triangle], areas: &[Area]) -> Vec<usize>
     }
 
     let edges = edge_map(triangles);
-    let groups = components(triangles.len(), &edges);
+    let mesh = Components::build(triangles.len(), &edges);
     let mut sealed = Vec::new();
-    for members in groups {
-        if !is_closed(&members, &edges) {
-            continue;
-        }
+    for members in mesh.closed_groups() {
+        let root = mesh.root[members[0]];
         let subset: Vec<Triangle> = members.iter().map(|&index| triangles[index]).collect();
         let shell = Scene::build(&subset);
-        if !has_geometry_outside(&shell, &members, triangles) {
+        if !has_geometry_outside(&shell, root, &mesh.root, triangles) {
             continue;
         }
         for (index, area) in areas.iter().enumerate() {
@@ -45,6 +45,60 @@ pub(crate) fn sealed_areas(triangles: &[Triangle], areas: &[Area]) -> Vec<usize>
     }
     sealed.sort_unstable();
     sealed
+}
+
+/// Triangles joined across shared edges. A component is closed when every
+/// edge touching it is shared by exactly two triangles — one pass over the
+/// edges, instead of one pass per component.
+struct Components {
+    /// Representative triangle of each triangle's component.
+    root: Vec<usize>,
+    /// Set on the representative when some edge of the component is not shared by exactly two.
+    open: Vec<bool>,
+}
+
+impl Components {
+    fn build(count: usize, edges: &HashMap<([i32; 3], [i32; 3]), Vec<usize>>) -> Self {
+        let mut parent: Vec<usize> = (0..count).collect();
+        for shared in edges.values() {
+            for other in shared.iter().skip(1) {
+                unite(&mut parent, shared[0], *other);
+            }
+        }
+        let root: Vec<usize> = (0..count).map(|index| find(&mut parent, index)).collect();
+        let mut open = vec![false; count];
+        for shared in edges.values() {
+            if shared.len() == 2 {
+                continue;
+            }
+            for &index in shared {
+                open[root[index]] = true;
+            }
+        }
+        Self { root, open }
+    }
+
+    /// Members of every closed component, each list in ascending triangle order.
+    fn closed_groups(&self) -> Vec<Vec<usize>> {
+        let count = self.root.len();
+        let mut size = vec![0usize; count];
+        for &root in &self.root {
+            size[root] += 1;
+        }
+        let mut slot = vec![usize::MAX; count];
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (index, &root) in self.root.iter().enumerate() {
+            if self.open[root] || size[root] < MIN_SHELL {
+                continue;
+            }
+            if slot[root] == usize::MAX {
+                slot[root] = groups.len();
+                groups.push(Vec::with_capacity(size[root]));
+            }
+            groups[slot[root]].push(index);
+        }
+        groups
+    }
 }
 
 fn edge_map(triangles: &[Triangle]) -> HashMap<([i32; 3], [i32; 3]), Vec<usize>> {
@@ -77,30 +131,6 @@ fn vertex_key(point: Vec3) -> [i32; 3] {
     ]
 }
 
-fn components(
-    count: usize,
-    edges: &HashMap<([i32; 3], [i32; 3]), Vec<usize>>,
-) -> Vec<HashSet<usize>> {
-    let mut parent: Vec<usize> = (0..count).collect();
-    for shared in edges.values() {
-        if shared.len() < 2 {
-            continue;
-        }
-        for other in &shared[1..] {
-            unite(&mut parent, shared[0], *other);
-        }
-    }
-
-    let mut groups: HashMap<usize, HashSet<usize>> = HashMap::new();
-    for index in 0..count {
-        groups
-            .entry(find(&mut parent, index))
-            .or_default()
-            .insert(index);
-    }
-    groups.into_values().collect()
-}
-
 fn find(parent: &mut [usize], mut index: usize) -> usize {
     while parent[index] != index {
         parent[index] = parent[parent[index]];
@@ -117,24 +147,14 @@ fn unite(parent: &mut [usize], left: usize, right: usize) {
     }
 }
 
-fn is_closed(members: &HashSet<usize>, edges: &HashMap<([i32; 3], [i32; 3]), Vec<usize>>) -> bool {
-    if members.len() < 4 {
-        return false;
-    }
-    for shared in edges.values() {
-        if !shared.iter().any(|index| members.contains(index)) {
-            continue;
-        }
-        if shared.len() != 2 || shared.iter().any(|index| !members.contains(index)) {
-            return false;
-        }
-    }
-    true
-}
-
-fn has_geometry_outside(shell: &Scene, members: &HashSet<usize>, triangles: &[Triangle]) -> bool {
+fn has_geometry_outside(
+    shell: &Scene,
+    root: usize,
+    roots: &[usize],
+    triangles: &[Triangle],
+) -> bool {
     triangles.iter().enumerate().any(|(index, triangle)| {
-        if members.contains(&index) {
+        if roots[index] == root {
             return false;
         }
         let centroid = (triangle.vertices[0] + triangle.vertices[1] + triangle.vertices[2]) / 3.0;

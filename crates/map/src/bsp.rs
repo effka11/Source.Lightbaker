@@ -1,16 +1,18 @@
 //! Source 1 BSP (version 19 and 20). Luxel positions come from the lightmap
 //! sizes already stored on each face. Props are left out.
 
-use glam::{Mat3, Vec3};
+use glam::{Mat3, Vec2, Vec3};
 use solve::{faces_solid, Receiver, Role, Triangle};
 
+use crate::cell::Outline;
 use crate::disp::{self, DispVert};
 use crate::pak;
-use crate::{Error, FaceLight, Luxel, Span};
+use crate::{Error, FaceLight, Luxel, Span, Surface};
 
 const LUMPS: usize = 64;
 const FACE: usize = 56;
 const SKIP_OCCLUDE: i32 = 0x0002 | 0x0004 | 0x0040 | 0x0100 | 0x0200;
+const NODRAW: i32 = 0x0080;
 const BUMP: i32 = 0x0800;
 
 const PLANES: usize = 1;
@@ -61,6 +63,18 @@ struct Tex {
     texdata: i32,
 }
 
+impl Tex {
+    /// Lightmap coordinates of a world point.
+    fn luxel(&self, point: Vec3) -> Vec2 {
+        let s = Vec3::new(self.light_s[0], self.light_s[1], self.light_s[2]);
+        let t = Vec3::new(self.light_t[0], self.light_t[1], self.light_t[2]);
+        Vec2::new(
+            point.dot(s) + self.light_s[3],
+            point.dot(t) + self.light_t[3],
+        )
+    }
+}
+
 struct Disp {
     start: Vec3,
     vert_start: i32,
@@ -83,13 +97,22 @@ impl Basis {
 
 pub struct Assembled {
     pub triangles: Vec<Triangle>,
+    pub surface: Vec<Surface>,
     pub luxels: Vec<Luxel>,
     pub faces: Vec<FaceLight>,
     pub lighting: Span,
     pub lighting_hdr: Span,
 }
 
+#[allow(dead_code)] // unit tests assemble a map without reporting progress
 pub fn assemble(data: &[u8]) -> Result<Assembled, Error> {
+    assemble_reporting(data, &|_, _, _| {})
+}
+
+pub(crate) fn assemble_reporting(
+    data: &[u8],
+    report: &(dyn Fn(crate::LoadPhase, u64, u64) + Sync),
+) -> Result<Assembled, Error> {
     let lumps = header(data)?;
     let planes = planes(slice(data, &lumps[PLANES])?)?;
     let vertices = vertices(slice(data, &lumps[VERTEXES])?)?;
@@ -105,11 +128,13 @@ pub fn assemble(data: &[u8]) -> Result<Assembled, Error> {
     let albedo = pak::albedos(slice(data, &lumps[PAKFILE])?, &names, &reflectivity);
 
     let mut triangles = Vec::new();
+    let mut surface = Vec::new();
     let mut luxels = Vec::new();
     let mut slots = Vec::with_capacity(faces.len());
     let mut grids = 0u32;
+    let world_steps = faces.len() as u64 + 1;
 
-    for face in &faces {
+    for (index, face) in faces.iter().enumerate() {
         let plane = face_plane(planes.get(face.plane), face.side);
         let points = face_points(face, &surfedges, &edges, &vertices);
         let tex = (face.texinfo >= 0)
@@ -117,6 +142,7 @@ pub fn assemble(data: &[u8]) -> Result<Assembled, Error> {
             .flatten();
         let flags = tex.map(|tex| tex.flags).unwrap_or(0);
         let block = flags & SKIP_OCCLUDE == 0;
+        let draw = flags & (SKIP_OCCLUDE | NODRAW) == 0;
         let (width, height) = grid_size(face);
         let has_grid = face.light_offset >= 0 && width > 0;
         if has_grid {
@@ -148,11 +174,13 @@ pub fn assemble(data: &[u8]) -> Result<Assembled, Error> {
                 height,
                 color,
                 block,
+                draw,
+                &mut triangles,
+                &mut surface,
             )
         });
 
-        if let Some((extra, face_luxels)) = displaced {
-            triangles.extend(extra);
+        if let Some(face_luxels) = displaced {
             if has_grid {
                 luxels.extend(face_luxels);
             }
@@ -160,11 +188,16 @@ pub fn assemble(data: &[u8]) -> Result<Assembled, Error> {
             if block {
                 fan(&points, &mut triangles);
             }
+            if draw {
+                fan_surface(&points, color, &mut surface);
+            }
             if has_grid {
-                if let (Some(plane), Some(basis)) = (plane, basis) {
+                if let (Some(plane), Some(basis), Some(tex)) = (plane, basis, tex) {
                     flat_luxels(
                         &basis,
                         plane.normal,
+                        tex,
+                        &points,
                         face,
                         width,
                         height,
@@ -184,6 +217,7 @@ pub fn assemble(data: &[u8]) -> Result<Assembled, Error> {
             first_luxel: first,
             luxel_count: luxels.len() as u32 - first,
         });
+        report(crate::LoadPhase::World, index as u64 + 1, world_steps);
     }
     turn_faces(
         &triangles,
@@ -193,6 +227,7 @@ pub fn assemble(data: &[u8]) -> Result<Assembled, Error> {
             .map(|face| (face.first_luxel, face.luxel_count))
             .collect::<Vec<_>>(),
     );
+    report(crate::LoadPhase::World, world_steps, world_steps);
 
     if grids == 0 || luxels.is_empty() {
         return Err(Error::NoLuxelGrid);
@@ -200,6 +235,7 @@ pub fn assemble(data: &[u8]) -> Result<Assembled, Error> {
 
     Ok(Assembled {
         triangles,
+        surface,
         luxels,
         faces: slots,
         lighting: span(&lumps[LIGHTING]),
@@ -505,7 +541,10 @@ fn displace(
     height: i32,
     albedo: Vec3,
     block: bool,
-) -> Option<(Vec<Triangle>, Vec<Luxel>)> {
+    draw: bool,
+    triangles: &mut Vec<Triangle>,
+    drawn: &mut Vec<Surface>,
+) -> Option<Vec<Luxel>> {
     if points.len() < 4 || !(2..=4).contains(&disp.power) || disp.vert_start < 0 {
         return None;
     }
@@ -517,8 +556,7 @@ fn displace(
     let surface = disp::surface(corners, slice, disp.power)?;
     let tris = disp::triangulation(disp.power);
     let face_normal = face_normal.normalize_or_zero();
-    let mut occluders = Vec::new();
-    if block {
+    if block || draw {
         for (index, tri) in tris.iter().enumerate() {
             if removed(tags, disp.tri_start, index) {
                 continue;
@@ -529,7 +567,12 @@ fn displace(
             if normal.dot(face_normal) < 0.0 {
                 wound.swap(0, 1);
             }
-            push_tri(&mut occluders, wound);
+            if block {
+                push_tri(triangles, wound);
+            }
+            if draw {
+                push_surface(drawn, wound, albedo);
+            }
         }
     }
 
@@ -550,8 +593,8 @@ fn displace(
                     })
                 });
                 let (position, normal) = placed.unwrap_or_else(|| {
-                    let u = (s as f32 + 0.5) / width as f32;
-                    let v = (t as f32 + 0.5) / height as f32;
+                    let u = s as f32 / (width - 1).max(1) as f32;
+                    let v = t as f32 / (height - 1).max(1) as f32;
                     (disp::bilinear(corners, u, v), face_normal)
                 });
                 let normal = if normal == Vec3::ZERO {
@@ -559,12 +602,14 @@ fn displace(
                 } else {
                     normal
                 };
-                let corners = luxel_corners(basis, face, s, t, position, normal);
+                let corners = disp::cell(&surface, disp.power, s, t, width, height)
+                    .map(|corners| corners.to_vec())
+                    .unwrap_or_else(|| luxel_corners(basis, face, s, t, position, normal));
                 push_luxel(&mut luxels, position, normal, albedo, corners);
             }
         }
     }
-    Some((occluders, luxels))
+    Some(luxels)
 }
 
 fn sample_point(
@@ -603,9 +648,17 @@ fn removed(tags: &[u8], tri_start: i32, index: usize) -> bool {
     tag & (1 << 5) != 0
 }
 
+/// Luxel `(s, t)` is one texel. Its square runs from `(mins + s, mins + t)`
+/// to the next integer, and the engine shows that texel at the square's
+/// center. Light is gathered where the square meets the face, so a square a
+/// wall cuts samples the face, not the solid beside it. A square off the face
+/// borrows the nearest point inside and draws nothing.
+#[allow(clippy::too_many_arguments)]
 fn flat_luxels(
     basis: &Basis,
     normal: Vec3,
+    tex: &Tex,
+    points: &[Vec3],
     face: &Face,
     width: i32,
     height: i32,
@@ -613,18 +666,32 @@ fn flat_luxels(
     luxels: &mut Vec<Luxel>,
 ) {
     let normal = normal.normalize_or_zero();
+    let outline: Vec<Vec2> = points.iter().map(|point| tex.luxel(*point)).collect();
+    let outline = Outline::new(&outline);
     for t in 0..height {
         for s in 0..width {
-            let s0 = (face.mins[0] + s) as f32;
-            let t0 = (face.mins[1] + t) as f32;
-            let position = basis.at(s0 + 0.5, t0 + 0.5);
-            let corners = [
-                basis.at(s0, t0),
-                basis.at(s0 + 1.0, t0),
-                basis.at(s0 + 1.0, t0 + 1.0),
-                basis.at(s0, t0 + 1.0),
-            ];
-            push_luxel(luxels, position, normal, albedo, corners);
+            let center = Vec2::new(
+                (face.mins[0] + s) as f32 + 0.5,
+                (face.mins[1] + t) as f32 + 0.5,
+            );
+            let (sample, piece) = match &outline {
+                Some(outline) => {
+                    let cell = outline.cell(center);
+                    (cell.sample, cell.piece)
+                }
+                None => (center, Vec::new()),
+            };
+            let corners = piece
+                .iter()
+                .map(|point| basis.at(point.x, point.y))
+                .collect();
+            push_luxel(
+                luxels,
+                basis.at(sample.x, sample.y),
+                normal,
+                albedo,
+                corners,
+            );
         }
     }
 }
@@ -636,18 +703,18 @@ fn luxel_corners(
     t: i32,
     position: Vec3,
     normal: Vec3,
-) -> [Vec3; 4] {
+) -> Vec<Vec3> {
     let Some(basis) = basis else {
         return tangent_quad(position, normal, 8.0);
     };
     let s0 = (face.mins[0] + s) as f32;
     let t0 = (face.mins[1] + t) as f32;
-    let shift = position - basis.at(s0 + 0.5, t0 + 0.5);
-    let mut corners = [
-        basis.at(s0, t0) + shift,
-        basis.at(s0 + 1.0, t0) + shift,
-        basis.at(s0 + 1.0, t0 + 1.0) + shift,
-        basis.at(s0, t0 + 1.0) + shift,
+    let shift = position - basis.at(s0, t0);
+    let mut corners = vec![
+        basis.at(s0 - 0.5, t0 - 0.5) + shift,
+        basis.at(s0 + 0.5, t0 - 0.5) + shift,
+        basis.at(s0 + 0.5, t0 + 0.5) + shift,
+        basis.at(s0 - 0.5, t0 + 0.5) + shift,
     ];
     if normal != Vec3::ZERO {
         for corner in &mut corners {
@@ -658,7 +725,7 @@ fn luxel_corners(
     corners
 }
 
-fn tangent_quad(position: Vec3, normal: Vec3, half: f32) -> [Vec3; 4] {
+fn tangent_quad(position: Vec3, normal: Vec3, half: f32) -> Vec<Vec3> {
     let normal = normal.normalize_or_zero();
     let helper = if normal.z.abs() > 0.9 {
         Vec3::X
@@ -667,7 +734,7 @@ fn tangent_quad(position: Vec3, normal: Vec3, half: f32) -> [Vec3; 4] {
     };
     let tangent = helper.cross(normal).normalize_or_zero() * half;
     let bitangent = normal.cross(tangent.normalize_or_zero()) * half;
-    [
+    vec![
         position - tangent - bitangent,
         position + tangent - bitangent,
         position + tangent + bitangent,
@@ -680,7 +747,7 @@ fn push_luxel(
     position: Vec3,
     normal: Vec3,
     albedo: Vec3,
-    corners: [Vec3; 4],
+    corners: Vec<Vec3>,
 ) {
     if !position.is_finite() || !normal.is_finite() {
         return;
@@ -743,12 +810,39 @@ fn fan(points: &[Vec3], triangles: &mut Vec<Triangle>) {
     }
 }
 
+fn fan_surface(points: &[Vec3], albedo: Vec3, drawn: &mut Vec<Surface>) {
+    if points.len() < 3 {
+        return;
+    }
+    for index in 1..points.len() - 1 {
+        push_surface(
+            drawn,
+            [points[0], points[index], points[index + 1]],
+            albedo,
+        );
+    }
+}
+
 fn push_tri(triangles: &mut Vec<Triangle>, corners: [Vec3; 3]) {
-    let normal = (corners[1] - corners[0]).cross(corners[2] - corners[0]);
-    if normal.length_squared() < 1.0e-6 {
+    if !stands(corners) {
         return;
     }
     triangles.push(Triangle { vertices: corners });
+}
+
+fn push_surface(drawn: &mut Vec<Surface>, corners: [Vec3; 3], albedo: Vec3) {
+    if !stands(corners) {
+        return;
+    }
+    drawn.push(Surface {
+        vertices: corners,
+        albedo,
+    });
+}
+
+fn stands(corners: [Vec3; 3]) -> bool {
+    let normal = (corners[1] - corners[0]).cross(corners[2] - corners[0]);
+    normal.length_squared() >= 1.0e-6
 }
 
 fn vec3(data: &[u8], offset: usize) -> Vec3 {
@@ -769,4 +863,145 @@ fn i32(data: &[u8], offset: usize) -> i32 {
 
 fn i16(data: &[u8], offset: usize) -> i16 {
     i16::from_le_bytes([data[offset], data[offset + 1]])
+}
+
+/// Longest drawn edge of each displacement, divided by one grid step of its quad.
+#[cfg(test)]
+pub(crate) fn terrain_stretch(data: &[u8]) -> Vec<f32> {
+    let lumps = header(data).expect("header");
+    let vertices = vertices(slice(data, &lumps[VERTEXES]).unwrap_or(&[])).unwrap_or_default();
+    let edges = edges(slice(data, &lumps[EDGES]).unwrap_or(&[])).unwrap_or_default();
+    let surfedges = surfedges(slice(data, &lumps[SURFEDGES]).unwrap_or(&[])).unwrap_or_default();
+    let faces = faces(slice(data, &lumps[FACES]).unwrap_or(&[])).unwrap_or_default();
+    let disps = disps(slice(data, &lumps[DISPINFO]).unwrap_or(&[])).unwrap_or_default();
+    let disp_verts = disp_verts(slice(data, &lumps[DISP_VERTS]).unwrap_or(&[])).unwrap_or_default();
+    let mut ratios = Vec::new();
+    for face in &faces {
+        if face.dispinfo < 0 {
+            continue;
+        }
+        let Some(disp) = disps.get(face.dispinfo as usize) else {
+            continue;
+        };
+        let points = face_points(face, &surfedges, &edges, &vertices);
+        if points.len() < 4 || !(2..=4).contains(&disp.power) || disp.vert_start < 0 {
+            continue;
+        }
+        let corners = disp::orient([points[0], points[1], points[2], points[3]], disp.start);
+        let side = (1 << disp.power) + 1;
+        let count = (side * side) as usize;
+        let start = disp.vert_start as usize;
+        let Some(slice) = disp_verts.get(start..start + count) else {
+            continue;
+        };
+        let Some(surface) = disp::surface(corners, slice, disp.power) else {
+            continue;
+        };
+        let step = (corners[1] - corners[0])
+            .length()
+            .max((corners[3] - corners[0]).length())
+            / (side - 1) as f32;
+        if step < 1.0 {
+            continue;
+        }
+        let mut max_edge = 0.0f32;
+        for tri in disp::triangulation(disp.power) {
+            let a = surface[tri[0] as usize];
+            let b = surface[tri[1] as usize];
+            let c = surface[tri[2] as usize];
+            max_edge = max_edge
+                .max((a - b).length())
+                .max((b - c).length())
+                .max((c - a).length());
+        }
+        ratios.push(max_edge / step);
+    }
+    ratios
+}
+
+/// Median gap along brush edges that two displacements both own.
+#[cfg(test)]
+pub(crate) fn shared_seam_median(data: &[u8]) -> f32 {
+    let lumps = header(data).expect("header");
+    let vertices = vertices(slice(data, &lumps[VERTEXES]).unwrap_or(&[])).unwrap_or_default();
+    let edges = edges(slice(data, &lumps[EDGES]).unwrap_or(&[])).unwrap_or_default();
+    let surfedges = surfedges(slice(data, &lumps[SURFEDGES]).unwrap_or(&[])).unwrap_or_default();
+    let faces = faces(slice(data, &lumps[FACES]).unwrap_or(&[])).unwrap_or_default();
+    let disps = disps(slice(data, &lumps[DISPINFO]).unwrap_or(&[])).unwrap_or_default();
+    let disp_verts = disp_verts(slice(data, &lumps[DISP_VERTS]).unwrap_or(&[])).unwrap_or_default();
+    let mut quads = Vec::new();
+    for face in &faces {
+        if face.dispinfo < 0 {
+            continue;
+        }
+        let Some(disp) = disps.get(face.dispinfo as usize) else {
+            continue;
+        };
+        let points = face_points(face, &surfedges, &edges, &vertices);
+        if points.len() < 4 || !(2..=4).contains(&disp.power) || disp.vert_start < 0 {
+            continue;
+        }
+        let corners = disp::orient([points[0], points[1], points[2], points[3]], disp.start);
+        let side = (1 << disp.power) + 1;
+        let count = (side * side) as usize;
+        let start = disp.vert_start as usize;
+        let Some(slice) = disp_verts.get(start..start + count) else {
+            continue;
+        };
+        let Some(surface) = disp::surface(corners, slice, disp.power) else {
+            continue;
+        };
+        quads.push((corners, surface, side));
+    }
+    let mut gaps = Vec::new();
+    for left in 0..quads.len() {
+        for right in left + 1..quads.len() {
+            for edge in 0..4 {
+                let a0 = quads[left].0[edge];
+                let a1 = quads[left].0[(edge + 1) % 4];
+                for other in 0..4 {
+                    let b0 = quads[right].0[other];
+                    let b1 = quads[right].0[(other + 1) % 4];
+                    let forward = (a0 - b0).length_squared() < 4.0 && (a1 - b1).length_squared() < 4.0;
+                    let backward =
+                        (a0 - b1).length_squared() < 4.0 && (a1 - b0).length_squared() < 4.0;
+                    if !forward && !backward {
+                        continue;
+                    }
+                    gaps.push(edge_gap(&quads[left], edge, &quads[right], other, backward));
+                }
+            }
+        }
+    }
+    gaps.sort_by(|left, right| left.total_cmp(right));
+    gaps[gaps.len() / 2]
+}
+
+#[cfg(test)]
+fn edge_gap(
+    left: &([Vec3; 4], Vec<Vec3>, i32),
+    left_edge: usize,
+    right: &([Vec3; 4], Vec<Vec3>, i32),
+    right_edge: usize,
+    backward: bool,
+) -> f32 {
+    let sample = |surface: &[Vec3], side: i32, edge: usize, t: f32| -> Vec3 {
+        let size = side - 1;
+        let along = (t.clamp(0.0, 1.0) * size as f32).round() as i32;
+        let (x, y) = match edge {
+            0 => (along, 0),
+            1 => (size, along),
+            2 => (size - along, size),
+            _ => (0, size - along),
+        };
+        surface[(y * side + x) as usize]
+    };
+    let mut gap = 0.0f32;
+    for step in 0..=8 {
+        let t = step as f32 / 8.0;
+        let p = sample(&left.1, left.2, left_edge, t);
+        let q = sample(&right.1, right.2, right_edge, if backward { 1.0 - t } else { t });
+        gap = gap.max((p - q).length());
+    }
+    gap
 }

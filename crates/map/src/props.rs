@@ -12,7 +12,7 @@ use zip::ZipArchive;
 
 use crate::studio::{self, Group, Vert};
 use crate::vpk;
-use crate::{Luxel, PropBody, PropLight, PropVerts};
+use crate::{Luxel, PropBody, PropLight, PropVerts, Surface};
 
 const GAME_LUMP: usize = 35;
 const PAK_LUMP: usize = 40;
@@ -36,25 +36,35 @@ struct Store {
 
 pub struct Placed {
     pub triangles: Vec<Triangle>,
+    pub surface: Vec<Surface>,
     pub luxels: Vec<Luxel>,
     pub props: Vec<PropLight>,
 }
 
-pub fn place(bsp: &[u8], path: &Path, first: u32) -> Placed {
+pub(crate) fn place_reporting(
+    bsp: &[u8],
+    path: &Path,
+    first: u32,
+    report: &(dyn Fn(crate::LoadPhase, u64, u64) + Sync),
+) -> Placed {
     let mut placed = Placed {
         triangles: Vec::new(),
+        surface: Vec::new(),
         luxels: Vec::new(),
         props: Vec::new(),
     };
     let props = static_props(bsp);
     if props.is_empty() {
+        report(crate::LoadPhase::Props, 1, 1);
         return placed;
     }
     let store = pak_store(lump(bsp, PAK_LUMP).unwrap_or(&[]));
     let mut packs = None;
     let mut cursor = first;
+    let prop_steps = props.len() as u64;
     for (index, prop) in props.iter().enumerate() {
-        let Some(model) = model_of(&store, &mut packs, path, &prop.model) else {
+        let Some(model) = model_of(&store, &mut packs, path, &prop.model, report) else {
+            report(crate::LoadPhase::Props, index as u64 + 1, prop_steps);
             continue;
         };
         let matrix = angle_matrix(prop.angles, prop.origin);
@@ -65,13 +75,14 @@ pub fn place(bsp: &[u8], path: &Path, first: u32) -> Placed {
             .collect();
         for group in groups.iter().filter(|group| group.lod == 0) {
             for tri in &group.triangles {
-                push_world(&mut placed.triangles, group, *tri);
+                push_world(&mut placed.triangles, &mut placed.surface, group, *tri);
             }
         }
         let resolution = ppl_size(&store, index).or(prop.lightmap);
         if let Some((width, height)) = resolution {
             let count = (width as usize).saturating_mul(height as usize);
             if count == 0 || count > 4096 * 4096 {
+                report(crate::LoadPhase::Props, index as u64 + 1, prop_steps);
                 continue;
             }
             let mut lods = Vec::new();
@@ -89,6 +100,7 @@ pub fn place(bsp: &[u8], path: &Path, first: u32) -> Placed {
             let samples = placed.luxels.len() - start;
             if samples == 0 || cursor as usize + samples > u32::MAX as usize {
                 placed.luxels.truncate(start);
+                report(crate::LoadPhase::Props, index as u64 + 1, prop_steps);
                 continue;
             }
             let (ldr, hdr) = ppl_names(&store, index);
@@ -106,9 +118,11 @@ pub fn place(bsp: &[u8], path: &Path, first: u32) -> Placed {
                 },
             });
             cursor += samples as u32;
+            report(crate::LoadPhase::Props, index as u64 + 1, prop_steps);
             continue;
         }
         if prop.flags & NO_VERTEX != 0 {
+            report(crate::LoadPhase::Props, index as u64 + 1, prop_steps);
             continue;
         }
         let mut meshes = Vec::new();
@@ -135,6 +149,7 @@ pub fn place(bsp: &[u8], path: &Path, first: u32) -> Placed {
         let samples = placed.luxels.len() - start;
         if samples == 0 || cursor as usize + samples > u32::MAX as usize {
             placed.luxels.truncate(start);
+            report(crate::LoadPhase::Props, index as u64 + 1, prop_steps);
             continue;
         }
         let (ldr, hdr) = vhv_names(&store, index);
@@ -146,7 +161,9 @@ pub fn place(bsp: &[u8], path: &Path, first: u32) -> Placed {
             body: PropBody::Vertices { meshes },
         });
         cursor += samples as u32;
+        report(crate::LoadPhase::Props, index as u64 + 1, prop_steps);
     }
+    report(crate::LoadPhase::Props, prop_steps, prop_steps);
     placed
 }
 
@@ -162,13 +179,14 @@ fn model_of(
     packs: &mut Option<Vec<vpk::Pack>>,
     path: &Path,
     model: &str,
+    report: &(dyn Fn(crate::LoadPhase, u64, u64) + Sync),
 ) -> Option<studio::Model> {
-    let mdl = file_of(store, packs, path, model)?;
+    let mdl = file_of(store, packs, path, model, report)?;
     let stem = model_stem(model);
-    let vvd = file_of(store, packs, path, &format!("{stem}.vvd"))?;
+    let vvd = file_of(store, packs, path, &format!("{stem}.vvd"), report)?;
     let vtx = ["dx90.vtx", "vtx", "sw.vtx", "dx80.vtx"]
         .iter()
-        .find_map(|ext| file_of(store, packs, path, &format!("{stem}.{ext}")));
+        .find_map(|ext| file_of(store, packs, path, &format!("{stem}.{ext}"), report));
     studio::load(&mdl, &vvd, &vtx?)
 }
 
@@ -184,12 +202,17 @@ fn file_of(
     packs: &mut Option<Vec<vpk::Pack>>,
     path: &Path,
     name: &str,
+    report: &(dyn Fn(crate::LoadPhase, u64, u64) + Sync),
 ) -> Option<Vec<u8>> {
     let key = normalize(name);
     if let Some(bytes) = store.files.get(&key) {
         return Some(bytes.clone());
     }
-    let packs = packs.get_or_insert_with(|| vpk::search(path));
+    let packs = packs.get_or_insert_with(|| {
+        vpk::search_with(path, &|done, total| {
+            report(crate::LoadPhase::Packs, done, total);
+        })
+    });
     vpk::read(packs, &key)
 }
 
@@ -209,7 +232,12 @@ fn transform_group(group: &Group, matrix: [[f32; 4]; 3]) -> Group {
     }
 }
 
-fn push_world(triangles: &mut Vec<Triangle>, group: &Group, tri: [u32; 3]) {
+fn push_world(
+    triangles: &mut Vec<Triangle>,
+    surface: &mut Vec<Surface>,
+    group: &Group,
+    tri: [u32; 3],
+) {
     let corners = tri.map(|index| {
         group
             .verts
@@ -222,6 +250,10 @@ fn push_world(triangles: &mut Vec<Triangle>, group: &Group, tri: [u32; 3]) {
         return;
     }
     triangles.push(Triangle { vertices: corners });
+    surface.push(Surface {
+        vertices: corners,
+        albedo: Vec3::splat(0.62),
+    });
 }
 
 fn raster(group: &Group, width: u32, height: u32) -> Vec<Sample> {
@@ -312,7 +344,7 @@ fn push_sample(luxels: &mut Vec<Luxel>, sample: Sample) {
         Vec3::ZERO
     };
     let corners = if normal == Vec3::ZERO {
-        [sample.position; 4]
+        Vec::new()
     } else {
         tangent_quad(sample.position, normal, 3.0)
     };
@@ -338,7 +370,7 @@ fn role_of(normal: Vec3) -> Role {
     }
 }
 
-fn tangent_quad(position: Vec3, normal: Vec3, half: f32) -> [Vec3; 4] {
+fn tangent_quad(position: Vec3, normal: Vec3, half: f32) -> Vec<Vec3> {
     let normal = normal.normalize_or_zero();
     let helper = if normal.z.abs() > 0.9 {
         Vec3::X
@@ -347,7 +379,7 @@ fn tangent_quad(position: Vec3, normal: Vec3, half: f32) -> [Vec3; 4] {
     };
     let tangent = helper.cross(normal).normalize_or_zero() * half;
     let bitangent = normal.cross(tangent.normalize_or_zero()) * half;
-    [
+    vec![
         position - tangent - bitangent,
         position + tangent - bitangent,
         position + tangent + bitangent,

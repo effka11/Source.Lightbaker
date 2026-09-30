@@ -21,5 +21,5 @@ if (-not (Test-Path -LiteralPath $bsp)) {
 }
 
 Set-Location (Split-Path -Parent $PSScriptRoot)
-& cargo run -p window -- $bsp
+& cargo run --release -p window -- $bsp
 exit $LASTEXITCODE

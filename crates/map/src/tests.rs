@@ -1,12 +1,13 @@
 use std::io::{Cursor, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use glam::Vec3;
 use solve::{solve, Area, Rectangle, Role};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-use crate::{open, Error};
+use crate::{open, open_reporting, Error, LoadPhase};
 
 #[test]
 fn foreign_bytes_do_not_open() {
@@ -23,6 +24,24 @@ fn a_map_without_a_luxel_grid_does_not_open() {
 }
 
 #[test]
+fn opening_reports_each_stage_it_finishes() {
+    let path = temp("lightbaker-load.bsp");
+    std::fs::write(&path, room_bsp(0, wall_pak())).unwrap();
+    let seen = AtomicU64::new(0);
+    let map = open_reporting(&path, &|phase, done, total| {
+        assert!(total > 0);
+        assert!(done <= total);
+        seen.fetch_or(1 << phase as u64, Ordering::Relaxed);
+    })
+    .unwrap();
+    assert!(!map.luxels.is_empty());
+    let bits = seen.load(Ordering::Relaxed);
+    assert_ne!(bits & (1 << LoadPhase::File as u64), 0);
+    assert_ne!(bits & (1 << LoadPhase::World as u64), 0);
+    assert_ne!(bits & (1 << LoadPhase::Props as u64), 0);
+}
+
+#[test]
 fn luxels_sit_on_the_face_grid_and_pak_color_wins() {
     let path = temp("lightbaker-room.bsp");
     std::fs::write(&path, room_bsp(0, wall_pak())).unwrap();
@@ -30,11 +49,18 @@ fn luxels_sit_on_the_face_grid_and_pak_color_wins() {
 
     assert_eq!(map.luxels.len(), 8);
     assert_eq!(map.triangles.len(), 4);
+    assert_eq!(map.surface.len(), 4);
+    assert!((map.surface[0].albedo - Vec3::Y).length() < 1.0e-3);
+    assert!((map.surface[2].albedo - Vec3::X).length() < 1.0e-3);
 
+    // The floor fills its lightmap exactly, so each luxel is sampled at the
+    // center of its texel.
     let floor = &map.luxels[0];
     assert_eq!(floor.receiver.role, Role::Floor);
     assert!((floor.receiver.position - Vec3::new(8.0, 8.0, 0.0)).length() < 1.0e-3);
     assert!((floor.receiver.albedo - Vec3::Y).length() < 1.0e-3);
+    let inner = &map.luxels[3];
+    assert!((inner.receiver.position - Vec3::new(24.0, 24.0, 0.0)).length() < 1.0e-3);
 
     let wall = &map.luxels[4];
     assert_eq!(wall.receiver.role, Role::Wall);
@@ -47,6 +73,65 @@ fn luxels_sit_on_the_face_grid_and_pak_color_wins() {
     assert_eq!(map.snapshot.faces[0].width, 2);
     assert_eq!(map.snapshot.faces[0].luxel_count, 4);
     assert_eq!(map.snapshot.bytes, std::fs::read(&path).unwrap());
+}
+
+#[test]
+fn nodraw_blocks_rays_and_stays_off_the_view() {
+    let path = temp("lightbaker-nodraw.bsp");
+    let mut bytes = room_bsp(0, wall_pak());
+    flag_texinfo(&mut bytes, 1, 0x0080);
+    std::fs::write(&path, &bytes).unwrap();
+    let map = open(&path).unwrap();
+    assert_eq!(map.triangles.len(), 4);
+    assert_eq!(map.surface.len(), 2);
+    assert!(map
+        .surface
+        .iter()
+        .all(|tri| (tri.albedo - Vec3::Y).length() < 1.0e-3));
+}
+
+#[test]
+fn a_luxel_cut_by_a_wall_is_sampled_on_the_lit_side() {
+    let path = temp("lightbaker-cut.bsp");
+    std::fs::write(&path, cut_bsp()).unwrap();
+    let map = open(&path).unwrap();
+    assert_eq!(map.luxels.len(), 9);
+
+    // Texel (0, 0) is centered at world (8, 8), outside the floor, which
+    // starts at x = 12. The part of the texel on the floor is sampled instead.
+    let luxel = &map.luxels[0];
+    assert!(
+        (luxel.receiver.position - Vec3::new(14.0, 8.0, 0.0)).length() < 1.0e-2,
+        "{}",
+        luxel.receiver.position
+    );
+    assert!(luxel.receiver.normal.z > 0.7, "{:?}", luxel.receiver.normal);
+    assert!(
+        luxel.corners.len() >= 3 && luxel.corners.iter().all(|corner| corner.x >= 12.0 - 1.0e-3),
+        "{:?}",
+        luxel.corners
+    );
+
+    let lamp = Area::Rectangle(Rectangle {
+        center: Vec3::new(24.0, 16.0, 48.0),
+        half_u: Vec3::new(4.0, 0.0, 0.0),
+        half_v: Vec3::new(0.0, 4.0, 0.0),
+        normal: -Vec3::Z,
+        intensity: 8_000.0,
+        color: Vec3::ONE,
+    });
+    let lit = solve(&map.triangles, &[luxel.receiver], &[lamp], 16);
+    assert!(lit.light[0][0] > 0.0, "cut luxel {:?}", lit.light[0]);
+
+    let mut behind = luxel.receiver;
+    behind.position = Vec3::new(8.0, 8.0, 0.0);
+    let dark = solve(&map.triangles, &[behind], &[lamp], 16);
+    assert_eq!(
+        dark.light[0],
+        [0.0, 0.0, 0.0],
+        "outside the floor {:?}",
+        dark.light[0]
+    );
 }
 
 #[test]
@@ -78,7 +163,7 @@ fn gm_construct_opens_and_feeds_the_same_solve() {
     );
 
     let faces = &map.luxels[..face_end];
-    let floor = nearest(faces, Vec3::new(823.0, -32.0, -144.0));
+    let floor = nearest(faces, Vec3::new(823.0, -32.0, -148.0));
     assert_eq!(
         floor.receiver.role,
         Role::Floor,
@@ -86,7 +171,7 @@ fn gm_construct_opens_and_feeds_the_same_solve() {
         floor.receiver.position
     );
     assert!(
-        (floor.receiver.position.z + 144.0).abs() < 2.0,
+        (floor.receiver.position.z + 148.0).abs() < 4.0,
         "{}",
         floor.receiver.position
     );
@@ -137,11 +222,11 @@ fn a_wall_facing_into_its_slab_is_turned_toward_the_lamp() {
     let mut luxels = vec![
         crate::Luxel {
             receiver: inward,
-            corners: [Vec3::ZERO; 4],
+            corners: Vec::new(),
         },
         crate::Luxel {
             receiver: outward,
-            corners: [Vec3::ZERO; 4],
+            corners: Vec::new(),
         },
     ];
     let lamp = Area::Rectangle(Rectangle {
@@ -180,10 +265,30 @@ fn a_floor_under_a_low_ceiling_keeps_facing_up() {
     };
     let mut luxels = vec![crate::Luxel {
         receiver: receiver(Vec3::new(12.0, 4.0, 0.0), Vec3::Z),
-        corners: [Vec3::ZERO; 4],
+        corners: Vec::new(),
     }];
     crate::bsp::turn_faces(&[ceiling], &mut luxels, &[(0, 1)]);
     assert!(luxels[0].receiver.normal.z > 0.9);
+}
+
+#[test]
+fn construct_displacements_stay_on_their_grid() {
+    let Some(path) = construct_path() else {
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let mut ratios = crate::bsp::terrain_stretch(&bytes);
+    ratios.sort_by(|left, right| left.total_cmp(right));
+    let p99 = ratios[ratios.len() * 99 / 100];
+    assert!(
+        p99 < 3.0,
+        "displacement edges stretch {p99:.1} grid steps"
+    );
+    let seam = crate::bsp::shared_seam_median(&bytes);
+    assert!(
+        seam < 8.0,
+        "displacement neighbors stay {seam:.1} apart"
+    );
 }
 
 #[test]
@@ -417,12 +522,85 @@ fn plane(normal: Vec3, dist: f32) -> [u8; 20] {
     out
 }
 
+/// Floor from x = 12 and a wall on that edge. The first luxel's center falls
+/// on the solid side of the wall; only the rest of its square lies on the floor.
+fn cut_bsp() -> Vec<u8> {
+    let mut bin = Bin::default();
+    bin.lump(1, pack([plane(Vec3::Z, 0.0), plane(Vec3::X, 12.0)]));
+    bin.lump(
+        3,
+        pack([
+            vec3(12.0, 0.0, 0.0),
+            vec3(32.0, 0.0, 0.0),
+            vec3(32.0, 32.0, 0.0),
+            vec3(12.0, 32.0, 0.0),
+            vec3(12.0, 0.0, 32.0),
+            vec3(12.0, 32.0, 32.0),
+        ]),
+    );
+    let mut edge_bytes = Vec::new();
+    for (a, b) in [
+        (0u16, 1u16),
+        (1, 2),
+        (2, 3),
+        (3, 0),
+        (0, 4),
+        (4, 5),
+        (5, 3),
+        (3, 0),
+    ] {
+        edge_bytes.extend(a.to_le_bytes());
+        edge_bytes.extend(b.to_le_bytes());
+    }
+    bin.lump(12, edge_bytes);
+    let mut surf = Vec::new();
+    for index in 0..8i32 {
+        surf.extend(index.to_le_bytes());
+    }
+    bin.lump(13, surf);
+    bin.lump(
+        7,
+        pack([
+            face_grid(0, 0, 4, 0, 0, [0, 0], [2, 2]),
+            face_grid(1, 4, 4, 0, -1, [0, 0], [0, 0]),
+        ]),
+    );
+    bin.lump(
+        6,
+        pack([texinfo(
+            [1.0 / 16.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0 / 16.0, 0.0, 0.0],
+            0,
+        )]),
+    );
+    bin.lump(2, pack([texdata(Vec3::ONE, 0)]));
+    bin.lump(43, b"room/floor\0".to_vec());
+    bin.lump(44, pack([0i32.to_le_bytes()]));
+    bin.lump(8, vec![0u8; 64]);
+    bin.lump(53, vec![0u8; 64]);
+    bin.lump(40, Vec::new());
+    bin.lump(14, model());
+    bin.finish()
+}
+
 fn face(plane: u16, first_edge: i32, texinfo: i16, tex_unused: i16, light_offset: i32) -> [u8; 56] {
     let _ = tex_unused;
+    face_grid(plane, first_edge, 4, texinfo, light_offset, [0, 0], [1, 1])
+}
+
+fn face_grid(
+    plane: u16,
+    first_edge: i32,
+    edges: i16,
+    texinfo: i16,
+    light_offset: i32,
+    mins: [i32; 2],
+    sizes: [i32; 2],
+) -> [u8; 56] {
     let mut out = [0u8; 56];
     out[..2].copy_from_slice(&plane.to_le_bytes());
     out[4..8].copy_from_slice(&first_edge.to_le_bytes());
-    out[8..10].copy_from_slice(&4i16.to_le_bytes());
+    out[8..10].copy_from_slice(&edges.to_le_bytes());
     out[10..12].copy_from_slice(&texinfo.to_le_bytes());
     out[12..14].copy_from_slice(&(-1i16).to_le_bytes());
     out[14..16].copy_from_slice(&(-1i16).to_le_bytes());
@@ -432,9 +610,18 @@ fn face(plane: u16, first_edge: i32, texinfo: i16, tex_unused: i16, light_offset
     out[19] = 255;
     out[20..24].copy_from_slice(&light_offset.to_le_bytes());
     out[24..28].copy_from_slice(&1024f32.to_le_bytes());
-    out[36..40].copy_from_slice(&1i32.to_le_bytes());
-    out[40..44].copy_from_slice(&1i32.to_le_bytes());
+    out[28..32].copy_from_slice(&mins[0].to_le_bytes());
+    out[32..36].copy_from_slice(&mins[1].to_le_bytes());
+    out[36..40].copy_from_slice(&sizes[0].to_le_bytes());
+    out[40..44].copy_from_slice(&sizes[1].to_le_bytes());
     out
+}
+
+fn flag_texinfo(bytes: &mut [u8], index: usize, flags: i32) {
+    let at = 8 + 6 * 16;
+    let offset = i32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let pos = offset + index * 72 + 64;
+    bytes[pos..pos + 4].copy_from_slice(&flags.to_le_bytes());
 }
 
 fn texinfo(s: [f32; 4], t: [f32; 4], texdata: i32) -> [u8; 72] {

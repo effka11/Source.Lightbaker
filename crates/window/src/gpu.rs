@@ -3,24 +3,21 @@ use std::sync::Arc;
 use eframe::egui;
 use eframe::egui_wgpu::{self, wgpu};
 
-pub struct Vertex {
-    pub position: [f32; 3],
-    pub color: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct GpuVertex {
-    position: [f32; 3],
-    color: [f32; 3],
-}
+const POS_ATTR: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x3];
+const COLOR_ATTR: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![1 => Float32x3];
 
 pub struct RoomCallback {
-    pub vertices: Arc<Vec<Vertex>>,
-    pub mesh_id: u64,
+    pub positions: Arc<Vec<[f32; 3]>>,
+    pub position_id: u64,
+    pub colors: Arc<Vec<[f32; 3]>>,
+    pub color_id: u64,
+    pub marker_positions: Arc<Vec<[f32; 3]>>,
+    pub marker_colors: Arc<Vec<[f32; 3]>>,
+    pub marker_id: u64,
     pub view_proj: [[f32; 4]; 4],
     pub width: u32,
     pub height: u32,
+    pub slot: usize,
 }
 
 const SCENE_WGSL: &str = r#"
@@ -77,21 +74,34 @@ fn fs(input: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-struct Gpu {
-    scene_pipeline: wgpu::RenderPipeline,
-    blit_pipeline: wgpu::RenderPipeline,
-    scene_bind: wgpu::BindGroup,
-    blit_layout: wgpu::BindGroupLayout,
+struct ViewSlot {
     uniform: wgpu::Buffer,
-    sampler: wgpu::Sampler,
-    vertices: wgpu::Buffer,
-    vertex_capacity: u64,
+    scene_bind: wgpu::BindGroup,
     color: wgpu::Texture,
     depth: wgpu::Texture,
     blit_bind: wgpu::BindGroup,
     size: (u32, u32),
-    mesh_id: u64,
-    drawn: u32,
+}
+
+struct Gpu {
+    scene_pipeline: wgpu::RenderPipeline,
+    blit_pipeline: wgpu::RenderPipeline,
+    uniform_layout: wgpu::BindGroupLayout,
+    blit_layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    positions: wgpu::Buffer,
+    position_capacity: u64,
+    position_id: u64,
+    colors: wgpu::Buffer,
+    color_capacity: u64,
+    color_id: u64,
+    marker_positions: wgpu::Buffer,
+    marker_position_capacity: u64,
+    marker_position_id: u64,
+    marker_colors: wgpu::Buffer,
+    marker_color_capacity: u64,
+    marker_color_id: u64,
+    slots: Vec<ViewSlot>,
 }
 
 impl Gpu {
@@ -118,20 +128,6 @@ impl Gpu {
                 count: None,
             }],
         });
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("room-uniform"),
-            size: 64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let scene_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("room-uniforms"),
-            layout: &uniform_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }],
-        });
         let scene_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("room-scene"),
             bind_group_layouts: &[&uniform_layout],
@@ -143,11 +139,18 @@ impl Gpu {
             vertex: wgpu::VertexState {
                 module: &scene_shader,
                 entry_point: Some("vs"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<GpuVertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
-                }],
+                buffers: &[
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 3]>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &POS_ATTR,
+                    },
+                    wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<[f32; 3]>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &COLOR_ATTR,
+                    },
+                ],
                 compilation_options: Default::default(),
             },
             primitive: wgpu::PrimitiveState {
@@ -241,52 +244,106 @@ impl Gpu {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
-        let vertices = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("room-vertices"),
-            size: 64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let (color, depth, blit_bind) = allocate_targets(device, &blit_layout, &sampler, 1, 1);
-
+        let positions = vertex_buffer(device, "room-positions", 64);
+        let colors = vertex_buffer(device, "room-colors", 64);
+        let marker_positions = vertex_buffer(device, "room-marker-positions", 64);
+        let marker_colors = vertex_buffer(device, "room-marker-colors", 64);
         Self {
             scene_pipeline,
             blit_pipeline,
-            scene_bind,
+            uniform_layout,
             blit_layout,
-            uniform,
             sampler,
-            vertices,
-            vertex_capacity: 64,
-            color,
-            depth,
-            blit_bind,
-            size: (1, 1),
-            mesh_id: u64::MAX,
-            drawn: 0,
+            positions,
+            position_capacity: 64,
+            position_id: u64::MAX,
+            colors,
+            color_capacity: 64,
+            color_id: u64::MAX,
+            marker_positions,
+            marker_position_capacity: 64,
+            marker_position_id: u64::MAX,
+            marker_colors,
+            marker_color_capacity: 64,
+            marker_color_id: u64::MAX,
+            slots: Vec::new(),
         }
     }
 
-    fn ensure(&mut self, device: &wgpu::Device, width: u32, height: u32, vertex_count: usize) {
-        if self.size != (width, height) {
-            let (color, depth, blit_bind) =
-                allocate_targets(device, &self.blit_layout, &self.sampler, width, height);
-            self.color = color;
-            self.depth = depth;
-            self.blit_bind = blit_bind;
-            self.size = (width, height);
-        }
-        let bytes = (vertex_count.max(1) * std::mem::size_of::<GpuVertex>()) as u64;
-        if bytes > self.vertex_capacity {
-            self.vertices = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("room-vertices"),
-                size: bytes,
-                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.vertex_capacity = bytes;
+    fn make_slot(&self, device: &wgpu::Device, width: u32, height: u32) -> ViewSlot {
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("room-uniform"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let scene_bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("room-uniforms"),
+            layout: &self.uniform_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+        let (color, depth, blit_bind) =
+            allocate_targets(device, &self.blit_layout, &self.sampler, width, height);
+        ViewSlot {
+            uniform,
+            scene_bind,
+            color,
+            depth,
+            blit_bind,
+            size: (width, height),
         }
     }
+
+    fn ensure_slot(&mut self, device: &wgpu::Device, index: usize, width: u32, height: u32) {
+        while self.slots.len() <= index {
+            self.slots.push(self.make_slot(device, 1, 1));
+        }
+        if self.slots[index].size != (width, height) {
+            let (color, depth, blit_bind) =
+                allocate_targets(device, &self.blit_layout, &self.sampler, width, height);
+            let slot = &mut self.slots[index];
+            slot.color = color;
+            slot.depth = depth;
+            slot.blit_bind = blit_bind;
+            slot.size = (width, height);
+        }
+    }
+}
+
+fn vertex_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn write_stream(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &mut wgpu::Buffer,
+    capacity: &mut u64,
+    stored_id: &mut u64,
+    id: u64,
+    label: &str,
+    data: &[[f32; 3]],
+) {
+    if *stored_id == id {
+        return;
+    }
+    let bytes = (data.len().max(1) * std::mem::size_of::<[f32; 3]>()) as u64;
+    if bytes > *capacity {
+        *buffer = vertex_buffer(device, label, bytes);
+        *capacity = bytes;
+    }
+    if !data.is_empty() {
+        queue.write_buffer(buffer, 0, bytemuck::cast_slice(data));
+    }
+    *stored_id = id;
 }
 
 fn allocate_targets(
@@ -358,34 +415,56 @@ impl egui_wgpu::CallbackTrait for RoomCallback {
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let gpu = resources.get_mut::<Gpu>().expect("room gpu resources");
-        if gpu.mesh_id != self.mesh_id {
-            gpu.drawn = self.vertices.len() as u32;
-        }
-        gpu.ensure(
+        let width = self.width.max(1);
+        let height = self.height.max(1);
+        gpu.ensure_slot(device, self.slot, width, height);
+        write_stream(
             device,
-            self.width.max(1),
-            self.height.max(1),
-            gpu.drawn.max(1) as usize,
+            queue,
+            &mut gpu.positions,
+            &mut gpu.position_capacity,
+            &mut gpu.position_id,
+            self.position_id,
+            "room-positions",
+            &self.positions,
         );
-        if gpu.mesh_id != self.mesh_id {
-            let packed: Vec<GpuVertex> = self
-                .vertices
-                .iter()
-                .map(|vertex| GpuVertex {
-                    position: vertex.position,
-                    color: vertex.color,
-                })
-                .collect();
-            if !packed.is_empty() {
-                queue.write_buffer(&gpu.vertices, 0, bytemuck::cast_slice(&packed));
-            }
-            gpu.mesh_id = self.mesh_id;
-            gpu.drawn = packed.len() as u32;
-        }
-        queue.write_buffer(&gpu.uniform, 0, bytemuck::cast_slice(&self.view_proj));
-
-        let color_view = gpu.color.create_view(&Default::default());
-        let depth_view = gpu.depth.create_view(&Default::default());
+        write_stream(
+            device,
+            queue,
+            &mut gpu.colors,
+            &mut gpu.color_capacity,
+            &mut gpu.color_id,
+            self.color_id,
+            "room-colors",
+            &self.colors,
+        );
+        write_stream(
+            device,
+            queue,
+            &mut gpu.marker_positions,
+            &mut gpu.marker_position_capacity,
+            &mut gpu.marker_position_id,
+            self.marker_id,
+            "room-marker-positions",
+            &self.marker_positions,
+        );
+        write_stream(
+            device,
+            queue,
+            &mut gpu.marker_colors,
+            &mut gpu.marker_color_capacity,
+            &mut gpu.marker_color_id,
+            self.marker_id,
+            "room-marker-colors",
+            &self.marker_colors,
+        );
+        let luxels = self.positions.len().min(self.colors.len()) as u32;
+        let markers = self.marker_positions.len().min(self.marker_colors.len()) as u32;
+        let slot = &gpu.slots[self.slot];
+        queue.write_buffer(&slot.uniform, 0, bytemuck::cast_slice(&self.view_proj));
+        let scene_bind = slot.scene_bind.clone();
+        let color_view = slot.color.create_view(&Default::default());
+        let depth_view = slot.depth.create_view(&Default::default());
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("room"),
         });
@@ -417,9 +496,17 @@ impl egui_wgpu::CallbackTrait for RoomCallback {
                 timestamp_writes: None,
             });
             pass.set_pipeline(&gpu.scene_pipeline);
-            pass.set_bind_group(0, &gpu.scene_bind, &[]);
-            pass.set_vertex_buffer(0, gpu.vertices.slice(..));
-            pass.draw(0..gpu.drawn, 0..1);
+            pass.set_bind_group(0, &scene_bind, &[]);
+            if luxels > 0 {
+                pass.set_vertex_buffer(0, gpu.positions.slice(..));
+                pass.set_vertex_buffer(1, gpu.colors.slice(..));
+                pass.draw(0..luxels, 0..1);
+            }
+            if markers > 0 {
+                pass.set_vertex_buffer(0, gpu.marker_positions.slice(..));
+                pass.set_vertex_buffer(1, gpu.marker_colors.slice(..));
+                pass.draw(0..markers, 0..1);
+            }
         }
         vec![encoder.finish()]
     }
@@ -431,6 +518,9 @@ impl egui_wgpu::CallbackTrait for RoomCallback {
         resources: &egui_wgpu::CallbackResources,
     ) {
         let gpu = resources.get::<Gpu>().expect("room gpu resources");
+        let Some(slot) = gpu.slots.get(self.slot) else {
+            return;
+        };
         let viewport = info.viewport_in_pixels();
         if viewport.width_px <= 0 || viewport.height_px <= 0 {
             return;
@@ -444,7 +534,7 @@ impl egui_wgpu::CallbackTrait for RoomCallback {
             1.0,
         );
         render_pass.set_pipeline(&gpu.blit_pipeline);
-        render_pass.set_bind_group(0, &gpu.blit_bind, &[]);
+        render_pass.set_bind_group(0, &slot.blit_bind, &[]);
         render_pass.draw(0..3, 0..1);
     }
 }

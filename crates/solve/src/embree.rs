@@ -61,6 +61,25 @@ struct RayHit {
 const _: () = assert!(std::mem::size_of::<RayHit>() == 96);
 const _: () = assert!(std::mem::align_of::<RayHit>() == 16);
 
+#[repr(C, align(16))]
+struct Ray {
+    org_x: f32,
+    org_y: f32,
+    org_z: f32,
+    tnear: f32,
+    dir_x: f32,
+    dir_y: f32,
+    dir_z: f32,
+    time: f32,
+    tfar: f32,
+    mask: u32,
+    id: u32,
+    flags: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<Ray>() == 48);
+const _: () = assert!(std::mem::align_of::<Ray>() == 16);
+
 unsafe extern "C" {
     fn rtcNewDevice(config: *const c_char) -> Device;
     fn rtcGetDeviceError(device: Device) -> i32;
@@ -86,6 +105,7 @@ unsafe extern "C" {
     );
 
     fn rtcIntersect1(scene: ScenePtr, rayhit: *mut RayHit, args: *mut ());
+    fn rtcOccluded1(scene: ScenePtr, ray: *mut Ray, args: *mut ());
 }
 
 struct SharedDevice(Device);
@@ -121,7 +141,8 @@ pub(crate) struct Hit {
     pub prim: usize,
 }
 
-/// Committed triangle scene. `rtcIntersect1` is safe to call from many threads.
+/// Committed triangle scene. Intersect and occluded queries are safe to call
+/// from many threads.
 pub struct Scene {
     scene: ScenePtr,
     triangles: Vec<Triangle>,
@@ -192,7 +213,25 @@ impl Scene {
     }
 
     pub fn occluded(&self, origin: Vec3, direction: Vec3, tfar: f32) -> bool {
-        self.hit(origin, direction, tfar).is_some()
+        if tfar <= 0.0 || self.triangles.is_empty() {
+            return false;
+        }
+        let mut ray = Ray {
+            org_x: origin.x,
+            org_y: origin.y,
+            org_z: origin.z,
+            tnear: 0.0,
+            dir_x: direction.x,
+            dir_y: direction.y,
+            dir_z: direction.z,
+            time: 0.0,
+            tfar,
+            mask: u32::MAX,
+            id: 0,
+            flags: 0,
+        };
+        unsafe { rtcOccluded1(self.scene, &mut ray, std::ptr::null_mut()) };
+        ray.tfar < 0.0
     }
 
     pub(crate) fn hit(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<Hit> {

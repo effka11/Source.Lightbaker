@@ -1,7 +1,8 @@
 //! Source VPK directory. Models a Hammer map leaves out of the pak live here.
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 struct Entry {
@@ -16,8 +17,30 @@ pub struct Pack {
     files: HashMap<String, Entry>,
 }
 
-pub fn search(map_path: &Path) -> Vec<Pack> {
+pub(crate) fn search_with(map_path: &Path, report: &(dyn Fn(u64, u64) + Sync)) -> Vec<Pack> {
+    let paths = pack_paths(map_path);
+    let total = paths
+        .iter()
+        .map(|path| fs::metadata(path).map(|meta| meta.len()).unwrap_or(0))
+        .fold(0u64, u64::saturating_add)
+        .max(1);
+    let mut done = 0u64;
+    report(0, total);
     let mut packs = Vec::new();
+    for path in paths {
+        let size = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        if let Some(pack) = open_reporting(&path, done, total, report) {
+            packs.push(pack);
+        }
+        done = done.saturating_add(size).min(total);
+        report(done, total);
+    }
+    report(total, total);
+    packs
+}
+
+fn pack_paths(map_path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
     let mut dir = map_path.parent();
     for _ in 0..6 {
         let Some(current) = dir else {
@@ -44,14 +67,12 @@ pub fn search(map_path: &Path) -> Vec<Pack> {
                 {
                     continue;
                 }
-                if let Some(pack) = open(&path) {
-                    packs.push(pack);
-                }
+                paths.push(path);
             }
         }
         dir = current.parent();
     }
-    packs
+    paths
 }
 
 pub fn read(packs: &[Pack], name: &str) -> Option<Vec<u8>> {
@@ -64,8 +85,37 @@ pub fn read(packs: &[Pack], name: &str) -> Option<Vec<u8>> {
     None
 }
 
-fn open(path: &Path) -> Option<Pack> {
-    let data = fs::read(path).ok()?;
+fn read_reporting(
+    path: &Path,
+    done: u64,
+    total: u64,
+    report: &(dyn Fn(u64, u64) + Sync),
+) -> Option<Vec<u8>> {
+    let mut file = File::open(path).ok()?;
+    let size = file.metadata().ok().map(|meta| meta.len()).unwrap_or(0);
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 256 * 1024];
+    let mut read_at = 0u64;
+    loop {
+        let read = file.read(&mut buf).ok()?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buf[..read]);
+        read_at += read as u64;
+        let at = done.saturating_add(read_at.min(size)).min(total);
+        report(at, total);
+    }
+    Some(bytes)
+}
+
+fn open_reporting(
+    path: &Path,
+    done: u64,
+    total: u64,
+    report: &(dyn Fn(u64, u64) + Sync),
+) -> Option<Pack> {
+    let data = read_reporting(path, done, total, report)?;
     if data.len() < 28 || u32_at(&data, 0)? != 0x55aa_1234 {
         return None;
     }

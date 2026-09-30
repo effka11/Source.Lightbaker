@@ -1,5 +1,5 @@
 use glam::Vec3;
-use solve::{solve, Area, Disk, Receiver, Rectangle, Role};
+use solve::{dynamic, solve, Area, Disk, Receiver, Rectangle, Role};
 
 fn ceiling_light() -> Area {
     Area::Rectangle(Rectangle {
@@ -46,6 +46,26 @@ fn light(
 }
 
 #[test]
+fn dynamic_matches_an_open_patch_and_ignores_occlusion() {
+    let area = ceiling_light();
+    let receiver = upward(Vec3::ZERO);
+    let open = light(&[], &[receiver], &area, 16);
+    assert_eq!(dynamic(&[receiver], &[area]), open);
+
+    let blocked = light(&quad(5.0, -20.0, 20.0, -20.0, 20.0), &[receiver], &area, 16);
+    assert_eq!(blocked[0], [0.0, 0.0, 0.0]);
+    assert_eq!(dynamic(&[receiver], &[area]), open);
+
+    let back = Receiver {
+        position: Vec3::ZERO,
+        normal: -Vec3::Z,
+        albedo: Vec3::ZERO,
+        role: Role::Other,
+    };
+    assert_eq!(dynamic(&[back], &[area]), vec![[0.0, 0.0, 0.0]]);
+}
+
+#[test]
 fn far_receiver_follows_nearest_point() {
     let area = ceiling_light();
     let near = upward(Vec3::ZERO);
@@ -58,6 +78,21 @@ fn far_receiver_follows_nearest_point() {
         "ratio {ratio}, expected {expected}"
     );
     assert!(colors[1][0] < colors[0][0]);
+}
+
+#[test]
+fn patch_behind_the_receiver_adds_nothing() {
+    let area = ceiling_light();
+    let floor = upward(Vec3::ZERO);
+    let back = Receiver {
+        position: Vec3::ZERO,
+        normal: -Vec3::Z,
+        albedo: Vec3::ZERO,
+        role: Role::Other,
+    };
+    let colors = light(&[], &[floor, back], &area, 16);
+    assert!(colors[0][0] > 0.0, "{:?}", colors[0]);
+    assert_eq!(colors[1], [0.0, 0.0, 0.0]);
 }
 
 #[test]

@@ -10,6 +10,8 @@ const MIN_DISTANCE: f32 = 1.0e-2;
 pub(crate) const RAY_LIFT: f32 = 0.5;
 const HIT_SLOP: f32 = 1.0e-3;
 const BOUNCES: u32 = 2;
+/// Direct light and each bounce. One progress unit per receiver per pass.
+pub const RAY_PASSES: u64 = 1 + BOUNCES as u64;
 const TRACE: f32 = 1.0e6;
 /// Floors dimmer than this fraction of the bounce already in the room are lifted.
 const LIFT_DARK: f32 = 0.1;
@@ -22,6 +24,27 @@ pub struct Solved {
 }
 
 pub fn solve(triangles: &[Triangle], receivers: &[Receiver], areas: &[Area], rays: u32) -> Solved {
+    solve_inner(triangles, receivers, areas, rays, None)
+}
+
+/// Same light as [`solve`]. `report` receives how many receivers finished a pass.
+pub fn solve_reporting(
+    triangles: &[Triangle],
+    receivers: &[Receiver],
+    areas: &[Area],
+    rays: u32,
+    report: &(dyn Fn(u64) + Sync),
+) -> Solved {
+    solve_inner(triangles, receivers, areas, rays, Some(report))
+}
+
+fn solve_inner(
+    triangles: &[Triangle],
+    receivers: &[Receiver],
+    areas: &[Area],
+    rays: u32,
+    report: Option<&(dyn Fn(u64) + Sync)>,
+) -> Solved {
     let sealed = sealed_areas(triangles, areas);
     if receivers.is_empty() {
         return Solved {
@@ -37,25 +60,44 @@ pub fn solve(triangles: &[Triangle], receivers: &[Receiver], areas: &[Area], ray
         .map(|(_, area)| area)
         .collect();
     if rays == 0 || open.is_empty() {
+        if let Some(report) = report {
+            report(receivers.len() as u64 * RAY_PASSES);
+        }
         return Solved {
             light: vec![[0.0, 0.0, 0.0]; receivers.len()],
             sealed,
         };
     }
 
+    // Temporary phase timing for the gm_construct measurement (LB_STATS=1).
+    let timing = std::env::var("LB_STATS").is_ok();
+    let mut clock = std::time::Instant::now();
+    let mut lap = |name: &str| {
+        if timing {
+            eprintln!("phase {name}: {} ms", clock.elapsed().as_millis());
+            clock = std::time::Instant::now();
+        }
+    };
+    lap("sealed");
     let scene = Scene::build(triangles);
-    let direct = direct_light(&scene, receivers, &open, rays);
+    lap("scene");
+    let direct = direct_light(&scene, receivers, &open, rays, report);
+    lap("direct");
     let mut light = direct.clone();
     let mut arriving = direct.clone();
+    let walls = WallIndex::build(receivers);
+    lap("wall index");
     for _ in 0..BOUNCES {
-        let bounced = diffuse_bounce(&scene, receivers, &arriving, rays);
+        let bounced = diffuse_bounce(&scene, receivers, &walls, &arriving, rays, report);
         for (slot, add) in light.iter_mut().zip(&bounced) {
             add_color(slot, *add);
         }
         arriving = bounced;
+        lap("bounce");
     }
     // Almost-black floors move toward bounce that already landed. No point in the room.
     lift_floors(&mut light, &direct, receivers);
+    lap("lift");
     Solved { light, sealed }
 }
 
@@ -98,22 +140,73 @@ pub(crate) fn unoccluded_intensity(area: &Area, position: Vec3) -> f32 {
     area.intensity() / (distance * distance)
 }
 
-fn direct_light(
-    scene: &Scene,
-    receivers: &[Receiver],
-    areas: &[&Area],
-    rays: u32,
-) -> Vec<[f32; 3]> {
+/// Direct light with the patch fully visible. No rays, bounce, or floor lift.
+pub fn dynamic(receivers: &[Receiver], areas: &[Area]) -> Vec<[f32; 3]> {
+    if receivers.is_empty() || areas.is_empty() {
+        return vec![[0.0, 0.0, 0.0]; receivers.len()];
+    }
     receivers
         .par_iter()
         .map(|receiver| {
             let mut sum = [0.0, 0.0, 0.0];
             for area in areas {
-                add_color(&mut sum, direct(scene, receiver, area, rays));
+                add_color(&mut sum, exposed(receiver, area));
             }
             sum
         })
         .collect()
+}
+
+fn exposed(receiver: &Receiver, area: &Area) -> [f32; 3] {
+    let normal = receiver.normal.normalize_or_zero();
+    let scale = unoccluded_intensity(area, receiver.position);
+    if scale == 0.0 || normal == Vec3::ZERO {
+        return [0.0, 0.0, 0.0];
+    }
+    let origin = receiver.position + normal * RAY_LIFT;
+    if !area_reaches(origin, normal, area) {
+        return [0.0, 0.0, 0.0];
+    }
+    let color = area.color();
+    [scale * color.x, scale * color.y, scale * color.z]
+}
+
+fn direct_light(
+    scene: &Scene,
+    receivers: &[Receiver],
+    areas: &[&Area],
+    rays: u32,
+    report: Option<&(dyn Fn(u64) + Sync)>,
+) -> Vec<[f32; 3]> {
+    let shade = |receiver: &Receiver| {
+        let mut sum = [0.0, 0.0, 0.0];
+        for area in areas {
+            add_color(&mut sum, direct(scene, receiver, area, rays));
+        }
+        sum
+    };
+    match report {
+        None => receivers.par_iter().map(shade).collect(),
+        Some(report) => by_chunk(receivers, shade, report),
+    }
+}
+
+/// Reports finished receivers without changing their order.
+fn by_chunk<T: Send>(
+    receivers: &[Receiver],
+    shade: impl Fn(&Receiver) -> T + Sync,
+    report: &(dyn Fn(u64) + Sync),
+) -> Vec<T> {
+    const CHUNK: usize = 4096;
+    let parts: Vec<Vec<T>> = receivers
+        .par_chunks(CHUNK)
+        .map(|chunk| {
+            let colors: Vec<T> = chunk.iter().map(&shade).collect();
+            report(colors.len() as u64);
+            colors
+        })
+        .collect();
+    parts.into_iter().flatten().collect()
 }
 
 fn direct(scene: &Scene, receiver: &Receiver, area: &Area, rays: u32) -> [f32; 3] {
@@ -124,6 +217,9 @@ fn direct(scene: &Scene, receiver: &Receiver, area: &Area, rays: u32) -> [f32; 3
     }
 
     let origin = receiver.position + normal * RAY_LIFT;
+    if !area_reaches(origin, normal, area) {
+        return [0.0, 0.0, 0.0];
+    }
     let mut hits = 0u32;
     for index in 0..rays {
         let sample = stratum_point(area, index, rays);
@@ -139,20 +235,45 @@ fn direct(scene: &Scene, receiver: &Receiver, area: &Area, rays: u32) -> [f32; 3
 fn diffuse_bounce(
     scene: &Scene,
     receivers: &[Receiver],
+    walls: &WallIndex,
     arriving: &[[f32; 3]],
     rays: u32,
+    report: Option<&(dyn Fn(u64) + Sync)>,
 ) -> Vec<[f32; 3]> {
-    let walls = WallIndex::build(receivers);
     if !walls.any() {
+        if let Some(report) = report {
+            report(receivers.len() as u64);
+        }
         return vec![[0.0, 0.0, 0.0]; receivers.len()];
     }
-    receivers
-        .par_iter()
-        .enumerate()
-        .map(|(index, receiver)| {
-            bounce_one(scene, receivers, &walls, arriving, index, receiver, rays)
-        })
-        .collect()
+    let shade = |index: usize, receiver: &Receiver| {
+        bounce_one(scene, receivers, walls, arriving, index, receiver, rays)
+    };
+    match report {
+        None => receivers
+            .par_iter()
+            .enumerate()
+            .map(|(index, receiver)| shade(index, receiver))
+            .collect(),
+        Some(report) => {
+            const CHUNK: usize = 4096;
+            let parts: Vec<Vec<[f32; 3]>> = receivers
+                .par_chunks(CHUNK)
+                .enumerate()
+                .map(|(chunk, group)| {
+                    let start = chunk * CHUNK;
+                    let colors: Vec<[f32; 3]> = group
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, receiver)| shade(start + offset, receiver))
+                        .collect();
+                    report(colors.len() as u64);
+                    colors
+                })
+                .collect();
+            parts.into_iter().flatten().collect()
+        }
+    }
 }
 
 fn bounce_one(
@@ -324,6 +445,43 @@ fn tangent_frame(normal: Vec3) -> (Vec3, Vec3) {
     (tangent, bitangent)
 }
 
+/// Convex patches only. False when no sample can face both the receiver and the
+/// lamp, which is the same zero the ray loop would return.
+fn area_reaches(origin: Vec3, normal: Vec3, area: &Area) -> bool {
+    match area {
+        Area::Rectangle(rectangle) => {
+            let mut toward_receiver = false;
+            let mut toward_lamp = false;
+            let lamp = rectangle.normal;
+            for corner in rectangle.corners() {
+                let delta = corner - origin;
+                toward_receiver |= delta.dot(normal) > 0.0;
+                toward_lamp |= delta.dot(lamp) < 0.0;
+                if toward_receiver && toward_lamp {
+                    return true;
+                }
+            }
+            false
+        }
+        Area::Disk(disk) => {
+            let (axis, bitangent) = disk.frame();
+            let radius = disk.radius.max(0.0);
+            let center = disk.center - origin;
+            let front = center.dot(normal) + radius * planar_extent(axis, bitangent, normal);
+            if front <= 0.0 {
+                return false;
+            }
+            let lamp = disk.normal;
+            let back = center.dot(lamp) - radius * planar_extent(axis, bitangent, lamp);
+            back < 0.0
+        }
+    }
+}
+
+fn planar_extent(axis: Vec3, bitangent: Vec3, direction: Vec3) -> f32 {
+    (axis.dot(direction).powi(2) + bitangent.dot(direction).powi(2)).sqrt()
+}
+
 fn arrives(
     scene: &Scene,
     origin: Vec3,
@@ -374,4 +532,60 @@ fn mix(from: [f32; 3], to: [f32; 3], factor: f32) -> [f32; 3] {
 
 fn luma(color: [f32; 3]) -> f32 {
     color[0] * 0.2126 + color[1] * 0.7152 + color[2] * 0.0722
+}
+
+#[cfg(test)]
+mod progress {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::{solve, solve_reporting, RAY_PASSES};
+    use crate::geom::{Area, Receiver, Rectangle, Role};
+    use glam::Vec3;
+
+    fn lamp() -> Area {
+        Area::Rectangle(Rectangle {
+            center: Vec3::new(0.0, 0.0, 8.0),
+            half_u: Vec3::new(2.0, 0.0, 0.0),
+            half_v: Vec3::new(0.0, 2.0, 0.0),
+            normal: -Vec3::Z,
+            intensity: 1000.0,
+            color: Vec3::ONE,
+        })
+    }
+
+    fn receiver(role: Role) -> Receiver {
+        Receiver {
+            position: Vec3::ZERO,
+            normal: Vec3::Z,
+            albedo: Vec3::ONE,
+            role,
+        }
+    }
+
+    #[test]
+    fn each_pass_is_counted_and_the_light_matches() {
+        let receivers = [receiver(Role::Wall), receiver(Role::Floor)];
+        let areas = [lamp()];
+        let plain = solve(&[], &receivers, &areas, 4);
+        let count = AtomicU64::new(0);
+        let reported = solve_reporting(&[], &receivers, &areas, 4, &|step| {
+            count.fetch_add(step, Ordering::Relaxed);
+        });
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            receivers.len() as u64 * RAY_PASSES
+        );
+        assert_eq!(plain, reported);
+    }
+
+    #[test]
+    fn a_pass_without_walls_is_still_counted() {
+        let receivers = [receiver(Role::Floor)];
+        let areas = [lamp()];
+        let count = AtomicU64::new(0);
+        let _ = solve_reporting(&[], &receivers, &areas, 4, &|step| {
+            count.fetch_add(step, Ordering::Relaxed);
+        });
+        assert_eq!(count.load(Ordering::Relaxed), RAY_PASSES);
+    }
 }

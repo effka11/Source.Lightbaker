@@ -32,11 +32,13 @@ pub fn orient(corners: [Vec3; 4], start: Vec3) -> [Vec3; 4] {
             best = index;
         }
     }
+    // Vertex 0 sits on the start corner. The grid's first edge runs against
+    // the face winding, which is how neighboring displacements were sewn.
     [
         corners[best],
-        corners[(best + 1) % 4],
-        corners[(best + 2) % 4],
         corners[(best + 3) % 4],
+        corners[(best + 2) % 4],
+        corners[(best + 1) % 4],
     ]
 }
 
@@ -102,6 +104,62 @@ pub fn surface(corners: [Vec3; 4], verts: &[DispVert], power: i32) -> Option<Vec
     Some(points)
 }
 
+/// Lightmap cell `(s, t)` covers one fraction of the displacement and meets its neighbors.
+pub fn cell(
+    points: &[Vec3],
+    power: i32,
+    s: i32,
+    t: i32,
+    width: i32,
+    height: i32,
+) -> Option<[Vec3; 4]> {
+    if width <= 0 || height <= 0 {
+        return None;
+    }
+    let w = width as f32;
+    let h = height as f32;
+    let u0 = s as f32 / w;
+    let v0 = t as f32 / h;
+    Some([
+        at(points, power, u0, v0)?,
+        at(points, power, u0 + 1.0 / w, v0)?,
+        at(points, power, u0 + 1.0 / w, v0 + 1.0 / h)?,
+        at(points, power, u0, v0 + 1.0 / h)?,
+    ])
+}
+
+pub fn at(points: &[Vec3], power: i32, u: f32, v: f32) -> Option<Vec3> {
+    if !(2..=4).contains(&power) {
+        return None;
+    }
+    let size = 1 << power;
+    let side = size + 1;
+    if points.len() < (side * side) as usize {
+        return None;
+    }
+    let u = u.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    let x = u * size as f32;
+    let y = v * size as f32;
+    let x0 = (x.floor() as i32).clamp(0, size);
+    let y0 = (y.floor() as i32).clamp(0, size);
+    let x1 = (x0 + 1).min(size);
+    let y1 = (y0 + 1).min(size);
+    let fx = if x0 == x1 { 0.0 } else { x - x0 as f32 };
+    let fy = if y0 == y1 { 0.0 } else { y - y0 as f32 };
+    let point = |x: i32, y: i32| points[(y * side + x) as usize];
+    let a = point(x0, y0);
+    let b = point(x1, y0);
+    let c = point(x1, y1);
+    let d = point(x0, y1);
+    Some(
+        a * ((1.0 - fx) * (1.0 - fy))
+            + b * (fx * (1.0 - fy))
+            + c * (fx * fy)
+            + d * ((1.0 - fx) * fy),
+    )
+}
+
 pub fn bilinear(corners: [Vec3; 4], u: f32, v: f32) -> Vec3 {
     let a = 1.0 - u;
     let b = 1.0 - v;
@@ -163,5 +221,34 @@ mod tests {
         let side = (1 << 4) + 1;
         let max = triangulation(4).into_iter().flatten().max().unwrap();
         assert!(max < (side * side) as u32);
+    }
+
+    #[test]
+    fn lightmap_cells_meet_and_follow_the_hill() {
+        let corners = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(64.0, 0.0, 0.0),
+            Vec3::new(64.0, 64.0, 0.0),
+            Vec3::new(0.0, 64.0, 0.0),
+        ];
+        let power = 2;
+        let side = (1 << power) + 1;
+        let mut verts = Vec::new();
+        for _ in 0..(side * side) {
+            verts.push(DispVert {
+                vector: Vec3::Z,
+                dist: 0.0,
+            });
+        }
+        verts[(2 * side + 2) as usize].dist = 32.0;
+        let points = surface(corners, &verts, power).unwrap();
+        let left = cell(&points, power, 0, 0, 2, 2).unwrap();
+        let right = cell(&points, power, 1, 0, 2, 2).unwrap();
+        let far = cell(&points, power, 0, 1, 2, 2).unwrap();
+        assert!((left[1] - right[0]).length() < 1.0e-3);
+        assert!((left[2] - right[3]).length() < 1.0e-3);
+        assert!((left[3] - far[0]).length() < 1.0e-3);
+        assert!((left[0].z).abs() < 1.0e-3);
+        assert!((left[2].z - 32.0).abs() < 1.0e-3);
     }
 }

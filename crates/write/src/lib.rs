@@ -20,6 +20,8 @@ const FACES: usize = 7;
 const LIGHTING: usize = 8;
 const PAKFILE: usize = 40;
 const LIGHTING_HDR: usize = 53;
+/// Garry's Mod reads these faces, not lump 7, whenever HDR is on.
+const FACES_HDR: usize = 58;
 /// Flat sample plus the three bump directions Source already stored.
 const BUMP_SLOTS: usize = 4;
 
@@ -112,6 +114,14 @@ fn assemble(snapshot: &Snapshot, light: &[[f32; 3]]) -> Result<Vec<u8>, Error> {
     }
     let (lighting, patches) = paint(&snapshot.faces, light)?;
     apply_faces(&mut lumps[FACES].data, &patches);
+    // HDR faces keep their own geometry, but their light offsets must land in
+    // the lighting we just wrote. Leaving the old offsets reads off the end.
+    if !lumps[FACES_HDR].data.is_empty() {
+        if lumps[FACES_HDR].fourcc != [0; 4] || lumps[FACES_HDR].data.len() != face_bytes {
+            return Err(Error::NotAMap);
+        }
+        apply_faces(&mut lumps[FACES_HDR].data, &patches);
+    }
     if !snapshot.props.is_empty() {
         lumps[PAKFILE].data = propfile::repack(&lumps[PAKFILE].data, &snapshot.props, light)?;
     }
