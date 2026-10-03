@@ -3,7 +3,6 @@
 
 use glam::Vec3;
 
-const MODEL_STRIDE: usize = 148;
 const MESH_STRIDE: usize = 116;
 const VERTEX_STRIDE: usize = 48;
 const VTX_HEADER: usize = 36;
@@ -20,6 +19,8 @@ pub struct Vert {
 
 pub struct Group {
     pub lod: u32,
+    /// Mesh slot in the model's skin table.
+    pub material: u32,
     pub verts: Vec<Vert>,
     pub triangles: Vec<[u32; 3]>,
 }
@@ -27,6 +28,33 @@ pub struct Group {
 pub struct Model {
     pub checksum: u32,
     pub groups: Vec<Group>,
+    /// Material paths, without the `materials/` prefix.
+    pub textures: Vec<String>,
+    skins: Vec<u16>,
+    skin_width: usize,
+}
+
+impl Model {
+    /// VMT path for one mesh. `skin` picks a family; the default family is 0.
+    pub fn material_name(&self, skin: i32, slot: u32) -> Option<&str> {
+        let slot = slot as usize;
+        let index = if self.skin_width == 0 || slot >= self.skin_width || self.skins.is_empty() {
+            slot
+        } else {
+            let families = (self.skins.len() / self.skin_width).max(1);
+            let family = (skin.max(0) as usize).min(families - 1);
+            let at = family * self.skin_width + slot;
+            self.skins
+                .get(at)
+                .copied()
+                .map(|id| id as usize)
+                .unwrap_or(slot)
+        };
+        self.textures
+            .get(index)
+            .map(String::as_str)
+            .filter(|name| !name.is_empty())
+    }
 }
 
 pub fn load(mdl: &[u8], vvd: &[u8], vtx: &[u8]) -> Option<Model> {
@@ -42,6 +70,7 @@ pub fn load(mdl: &[u8], vvd: &[u8], vtx: &[u8]) -> Option<Model> {
         return None;
     }
     let vertices = fixed_vertices(vvd)?;
+    let (textures, skins, skin_width) = read_textures(mdl);
     let mut groups = Vec::new();
     let bodyparts = i32_at(mdl, 232)?;
     let body_at = i32_at(mdl, 236)?;
@@ -63,16 +92,27 @@ pub fn load(mdl: &[u8], vvd: &[u8], vtx: &[u8]) -> Option<Model> {
         if models != vtx_models || models <= 0 || models > 32 {
             return None;
         }
-        for model in 0..models {
-            let mdl_model = model_at as usize + model as usize * MODEL_STRIDE;
-            let vtx_model = vtx_model_at as usize + model as usize * 8;
-            read_model(mdl, vtx, &vertices, mdl_model, vtx_model, &mut groups)?;
+        // A bodypart's later models are alternatives. The default body draws the first.
+        // An empty option (no hardware, no glass) must not throw the rest of the model away.
+        let mdl_model = model_at as usize;
+        let vtx_model = vtx_model_at as usize;
+        if i32_at(mdl, mdl_model + 72).unwrap_or(0) == 0 {
+            continue;
+        }
+        if read_model(mdl, vtx, &vertices, mdl_model, vtx_model, &mut groups).is_none() {
+            continue;
         }
     }
     if groups.is_empty() {
         return None;
     }
-    Some(Model { checksum, groups })
+    Some(Model {
+        checksum,
+        groups,
+        textures,
+        skins,
+        skin_width,
+    })
 }
 
 fn read_model(
@@ -104,6 +144,7 @@ fn read_model(
         }
         for mesh in 0..meshes {
             let mesh_base = mesh_at as usize + mesh as usize * MESH_STRIDE;
+            let slot = i32_at(mdl, mesh_base)?.max(0) as u32;
             let count = i32_at(mdl, mesh_base + 8)?;
             let offset = i32_at(mdl, mesh_base + 12)?;
             if count < 0 || offset < 0 {
@@ -124,6 +165,7 @@ fn read_model(
                     offset as usize,
                     count as usize,
                     lod as u32,
+                    slot,
                     group_base,
                     groups,
                 )?;
@@ -140,6 +182,7 @@ fn push_group(
     mesh_offset: usize,
     mesh_count: usize,
     lod: u32,
+    material: u32,
     group_base: usize,
     groups: &mut Vec<Group>,
 ) -> Option<()> {
@@ -205,6 +248,7 @@ fn push_group(
     }
     groups.push(Group {
         lod,
+        material,
         verts,
         triangles,
     });
@@ -287,4 +331,115 @@ fn i32_at(data: &[u8], offset: usize) -> Option<i32> {
 fn u16_at(data: &[u8], offset: usize) -> Option<u16> {
     let bytes = data.get(offset..offset + 2)?;
     Some(u16::from_le_bytes(bytes.try_into().ok()?))
+}
+
+/// Texture names and the skin table. A bad table leaves the mesh gray.
+fn read_textures(mdl: &[u8]) -> (Vec<String>, Vec<u16>, usize) {
+    let Some(count) = i32_at(mdl, 204) else {
+        return (Vec::new(), Vec::new(), 0);
+    };
+    if count <= 0 || count > 256 {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let Some(index) = i32_at(mdl, 208) else {
+        return (Vec::new(), Vec::new(), 0);
+    };
+    if index < 0 {
+        return (Vec::new(), Vec::new(), 0);
+    }
+    let dirs = cd_dirs(mdl);
+    let mut textures = Vec::with_capacity(count as usize);
+    for item in 0..count as usize {
+        let at = index as usize + item * 64;
+        let Some(name_at) = i32_at(mdl, at) else {
+            return (Vec::new(), Vec::new(), 0);
+        };
+        let start = at as i32 + name_at;
+        if start < 0 {
+            return (Vec::new(), Vec::new(), 0);
+        }
+        let Some(name) = cstring(mdl, start as usize) else {
+            return (Vec::new(), Vec::new(), 0);
+        };
+        textures.push(material_path(&dirs, &name));
+    }
+    let skin_width = i32_at(mdl, 220).unwrap_or(0).max(0) as usize;
+    let families = i32_at(mdl, 224).unwrap_or(0).max(0) as usize;
+    let skin_at = i32_at(mdl, 228).unwrap_or(-1);
+    if skin_width == 0 || skin_width > 256 || families == 0 || families > 64 || skin_at < 0 {
+        return (textures, Vec::new(), 0);
+    }
+    let total = skin_width * families;
+    let mut skins = Vec::with_capacity(total);
+    for item in 0..total {
+        let Some(id) = u16_at(mdl, skin_at as usize + item * 2) else {
+            return (textures, Vec::new(), 0);
+        };
+        skins.push(id);
+    }
+    (textures, skins, skin_width)
+}
+
+fn cd_dirs(mdl: &[u8]) -> Vec<String> {
+    let Some(count) = i32_at(mdl, 212) else {
+        return Vec::new();
+    };
+    let Some(index) = i32_at(mdl, 216) else {
+        return Vec::new();
+    };
+    if count <= 0 || count > 32 || index < 0 {
+        return Vec::new();
+    }
+    let mut dirs = Vec::new();
+    for item in 0..count as usize {
+        let Some(rel) = i32_at(mdl, index as usize + item * 4) else {
+            break;
+        };
+        let from_file = (rel >= 0).then(|| cstring(mdl, rel as usize)).flatten();
+        let from_table = index
+            .checked_add(rel)
+            .filter(|at| *at >= 0)
+            .and_then(|at| cstring(mdl, at as usize));
+        let Some(dir) = [from_file, from_table]
+            .into_iter()
+            .flatten()
+            .max_by_key(|text| {
+                text.bytes()
+                    .filter(|byte| *byte == b'/' || *byte == b'\\')
+                    .count()
+            })
+        else {
+            continue;
+        };
+        dirs.push(dir);
+    }
+    dirs
+}
+
+fn material_path(dirs: &[String], name: &str) -> String {
+    let name = name.replace('\\', "/");
+    if name.contains('/') || dirs.is_empty() {
+        return name.trim_matches('/').to_string();
+    }
+    let dir = dirs[0].replace('\\', "/");
+    let dir = dir.trim_matches('/');
+    if dir.is_empty() {
+        name
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+fn cstring(data: &[u8], offset: usize) -> Option<String> {
+    let rest = data.get(offset..)?;
+    let end = rest.iter().position(|byte| *byte == 0)?;
+    if end == 0 || end > 260 {
+        return None;
+    }
+    let text = std::str::from_utf8(&rest[..end]).ok()?;
+    let text = text.trim();
+    if text.is_empty() || !text.bytes().all(|byte| (32..127).contains(&byte)) {
+        return None;
+    }
+    Some(text.to_string())
 }

@@ -191,7 +191,12 @@ fn grate_gap_passes_and_bar_blocks() {
     let gap = other(Vec3::ZERO, Vec3::Z);
     let bar = other(Vec3::new(0.0, 6.0, 0.0), Vec3::Z);
     let colors = solve(&bars, &[gap, bar], &[light], 16).light;
-    assert!((colors[0][0] - 0.25).abs() < 1.0e-3, "gap {}", colors[0][0]);
+    let expected = 100.0 / (20.0 * 20.0 + 48.0 * 48.0);
+    assert!(
+        (colors[0][0] - expected).abs() < 1.0e-3,
+        "gap {}",
+        colors[0][0]
+    );
     assert_eq!(colors[1], [0.0, 0.0, 0.0]);
 }
 

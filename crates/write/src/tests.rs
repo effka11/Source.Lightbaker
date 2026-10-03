@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
-use super::{pack_sample, write, Error};
+use super::{pack_sample, write, Error, PlacedLight};
 
 const HEADER: usize = 8 + 64 * 16 + 4;
 
@@ -29,7 +29,7 @@ fn the_source_path_is_refused_and_the_file_stays() {
     std::fs::write(&source, &bytes).unwrap();
     let map = map::open(&source).unwrap();
     let light = vec![[1.0, 0.0, 0.0]; map.luxels.len()];
-    let error = write(&map.snapshot, &light, &source, &source).unwrap_err();
+    let error = write(&map.snapshot, &light, &[], &source, &source).unwrap_err();
     assert!(matches!(error, Error::SamePath));
     assert_eq!(std::fs::read(&source).unwrap(), bytes);
 }
@@ -41,7 +41,7 @@ fn light_that_does_not_match_the_receivers_is_refused() {
     let dest = dir.join("room_light.bsp");
     std::fs::write(&source, fixture()).unwrap();
     let map = map::open(&source).unwrap();
-    let error = write(&map.snapshot, &[[1.0, 0.0, 0.0]], &source, &dest).unwrap_err();
+    let error = write(&map.snapshot, &[[1.0, 0.0, 0.0]], &[], &source, &dest).unwrap_err();
     assert!(matches!(error, Error::Light));
     assert!(!dest.exists());
     assert_eq!(std::fs::read(&source).unwrap(), fixture());
@@ -82,7 +82,7 @@ fn the_neighbor_replaces_face_light_and_leaves_the_source() {
     light.extend_from_slice(&floor);
     light.extend_from_slice(&wall);
 
-    write(&map.snapshot, &light, &source, &dest).unwrap();
+    write(&map.snapshot, &light, &[], &source, &dest).unwrap();
     assert_eq!(std::fs::read(&source).unwrap(), original);
 
     let written = std::fs::read(&dest).unwrap();
@@ -162,7 +162,7 @@ fn hdr_faces_follow_the_new_lighting() {
     std::fs::write(&source, fixture_with_stale_hdr_faces()).unwrap();
     let map = map::open(&source).unwrap();
     let light = vec![[0.2, 0.3, 0.4]; map.luxels.len()];
-    write(&map.snapshot, &light, &source, &dest).unwrap();
+    write(&map.snapshot, &light, &[], &source, &dest).unwrap();
     let written = std::fs::read(&dest).unwrap();
     let ldr = lump(&written, 7);
     let hdr = lump(&written, 58);
@@ -179,6 +179,40 @@ fn hdr_faces_follow_the_new_lighting() {
             assert!((lightofs as usize) < lighting.len());
         }
     }
+}
+
+#[test]
+fn an_empty_worldlight_lump_receives_the_placed_lamps() {
+    let dir = scratch("worldlights");
+    let source = dir.join("room.bsp");
+    let dest = dir.join("room_light.bsp");
+    std::fs::write(&source, fixture()).unwrap();
+    let map = map::open(&source).unwrap();
+    let light = vec![[0.2, 0.2, 0.2]; map.luxels.len()];
+    let lamps = [PlacedLight {
+        origin: [16.0, 16.0, 64.0],
+        color: [1.0, 0.5, 0.25],
+        intensity: 18_000.0,
+    }];
+    write(&map.snapshot, &light, &lamps, &source, &dest).unwrap();
+    let written = std::fs::read(&dest).unwrap();
+    let world = lump(&written, 15);
+    assert_eq!(world.len(), 88);
+    assert_eq!(lump_version(&written, 15), 0);
+    let origin = [
+        f32::from_le_bytes(world[0..4].try_into().unwrap()),
+        f32::from_le_bytes(world[4..8].try_into().unwrap()),
+        f32::from_le_bytes(world[8..12].try_into().unwrap()),
+    ];
+    assert_eq!(origin, [16.0, 16.0, 64.0]);
+    assert_eq!(i32::from_le_bytes(world[40..44].try_into().unwrap()), 1);
+    assert_eq!(f32::from_le_bytes(world[72..76].try_into().unwrap()), 1.0);
+    let strength = f32::from_le_bytes(world[12..16].try_into().unwrap());
+    assert!((strength - 200.0).abs() < 1.0e-3, "{strength}");
+    let text = String::from_utf8(lump(&written, 0).to_vec()).unwrap();
+    assert_eq!(text.matches("\"classname\" \"light\"").count(), 2);
+    assert!(text.contains("16.000 16.000 64.000"));
+    assert!(text.contains("255 128 64 200"));
 }
 
 fn sample(bytes: &[u8], at: usize) -> [f32; 3] {

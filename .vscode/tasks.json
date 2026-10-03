@@ -2,16 +2,15 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "Lightbaker: gm_construct",
+            "label": "Lightbaker: Build & open",
             "type": "shell",
             "command": "powershell",
             "args": [
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",
-                "-File",
-                "${workspaceFolder}\\scripts\\lightbaker.ps1",
-                "gm_construct"
+                "-Command",
+                "Get-Process lightbaker -ErrorAction SilentlyContinue | Stop-Process -Force; cargo run --release -p window --bin lightbaker"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"
@@ -20,6 +19,10 @@
             "presentation": {
                 "reveal": "always",
                 "panel": "dedicated"
+            },
+            "group": {
+                "kind": "build",
+                "isDefault": true
             }
         }
     ]

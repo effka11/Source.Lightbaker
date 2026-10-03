@@ -20,6 +20,7 @@ const CHILDREN: [(i32, i32); 4] = [(1, 1), (-1, 1), (-1, -1), (1, -1)];
 pub struct DispVert {
     pub vector: Vec3,
     pub dist: f32,
+    pub alpha: f32,
 }
 
 pub fn orient(corners: [Vec3; 4], start: Vec3) -> [Vec3; 4] {
@@ -238,6 +239,7 @@ mod tests {
             verts.push(DispVert {
                 vector: Vec3::Z,
                 dist: 0.0,
+                alpha: 0.0,
             });
         }
         verts[(2 * side + 2) as usize].dist = 32.0;

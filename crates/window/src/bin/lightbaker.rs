@@ -1,3 +1,3 @@
 fn main() -> eframe::Result {
-    window::run(false)
+    window::run(true)
 }

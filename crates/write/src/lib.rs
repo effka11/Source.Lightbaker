@@ -17,9 +17,15 @@ const LUMPS: usize = 64;
 const HEADER: usize = 8 + LUMPS * 16 + 4;
 const FACE: usize = 56;
 const FACES: usize = 7;
+const ENTITIES: usize = 0;
 const LIGHTING: usize = 8;
+/// Compiled lights. An empty lump makes the engine set `mat_fullbright 1`.
+const WORLDLIGHTS: usize = 15;
 const PAKFILE: usize = 40;
 const LIGHTING_HDR: usize = 53;
+/// `dworldlight_t` as stored by version 0 of the lump.
+const WORLDLIGHT_BYTES: usize = 88;
+const EMIT_POINT: i32 = 1;
 /// Garry's Mod reads these faces, not lump 7, whenever HDR is on.
 const FACES_HDR: usize = 58;
 /// Flat sample plus the three bump directions Source already stored.
@@ -73,21 +79,35 @@ enum Patch {
     Lit(i32),
 }
 
+/// One placed lamp. The engine does not read the solve; it reads these as entities
+/// and as the worldlight lump. Without that lump it turns the whole map fullbright.
+#[derive(Clone, Copy, Debug)]
+pub struct PlacedLight {
+    pub origin: [f32; 3],
+    pub color: [f32; 3],
+    pub intensity: f32,
+}
+
 /// `source` is the map that was opened. The same path as `destination` is refused.
 pub fn write(
     snapshot: &Snapshot,
     light: &[[f32; 3]],
+    lights: &[PlacedLight],
     source: &Path,
     destination: &Path,
 ) -> Result<(), Error> {
     if same_path(source, destination) {
         return Err(Error::SamePath);
     }
-    let bytes = assemble(snapshot, light)?;
+    let bytes = assemble(snapshot, light, lights)?;
     commit(destination, &bytes)
 }
 
-fn assemble(snapshot: &Snapshot, light: &[[f32; 3]]) -> Result<Vec<u8>, Error> {
+fn assemble(
+    snapshot: &Snapshot,
+    light: &[[f32; 3]],
+    lights: &[PlacedLight],
+) -> Result<Vec<u8>, Error> {
     let data = &snapshot.bytes;
     if data.len() < HEADER || &data[..4] != b"VBSP" {
         return Err(Error::NotAMap);
@@ -131,7 +151,83 @@ fn assemble(snapshot: &Snapshot, light: &[[f32; 3]]) -> Result<Vec<u8>, Error> {
     }
     lumps[LIGHTING].data = lighting.clone();
     lumps[LIGHTING_HDR].data = lighting;
+    // Relapse ships with an empty worldlight lump and no light entities.
+    // The engine then sets mat_fullbright, so the lightmaps never show.
+    if lumps[WORLDLIGHTS].data.is_empty() && !lights.is_empty() {
+        lumps[WORLDLIGHTS].data = worldlight_records(lights);
+        lumps[WORLDLIGHTS].version = 0;
+        lumps[WORLDLIGHTS].present = true;
+        lumps[ENTITIES].data = append_entities(&lumps[ENTITIES].data, &entity_text(lights));
+        lumps[ENTITIES].present = true;
+    }
     Ok(pack(data, &lumps))
+}
+
+/// A fluorescent (18000) lands near a normal indoor Source brightness.
+/// The sun is far brighter in the solve; past 2000 the worldlight would cover the map.
+fn source_brightness(intensity: f32) -> f32 {
+    if !intensity.is_finite() || intensity <= 0.0 {
+        return 1.0;
+    }
+    (intensity / 18_000.0 * 200.0).clamp(1.0, 2_000.0)
+}
+
+fn worldlight_records(lights: &[PlacedLight]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(lights.len() * WORLDLIGHT_BYTES);
+    for light in lights {
+        let brightness = source_brightness(light.intensity);
+        let color = light.color.map(|channel| channel.clamp(0.0, 1.0) * brightness);
+        push_f32s(&mut out, &light.origin);
+        push_f32s(&mut out, &color);
+        push_f32s(&mut out, &[0.0, 0.0, 1.0]);
+        out.extend((-1i32).to_le_bytes());
+        out.extend(EMIT_POINT.to_le_bytes());
+        out.extend(0i32.to_le_bytes());
+        for value in [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] {
+            out.extend(value.to_le_bytes());
+        }
+        out.extend(0i32.to_le_bytes());
+        out.extend((-1i32).to_le_bytes());
+        out.extend((-1i32).to_le_bytes());
+    }
+    out
+}
+
+fn entity_text(lights: &[PlacedLight]) -> String {
+    let mut text = String::new();
+    for light in lights {
+        let brightness = source_brightness(light.intensity).round() as i32;
+        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as i32;
+        text.push_str(&format!(
+            "{{\n\"classname\" \"light\"\n\"origin\" \"{:.3} {:.3} {:.3}\"\n\"_light\" \"{} {} {} {brightness}\"\n}}\n",
+            light.origin[0],
+            light.origin[1],
+            light.origin[2],
+            channel(light.color[0]),
+            channel(light.color[1]),
+            channel(light.color[2]),
+        ));
+    }
+    text
+}
+
+fn append_entities(existing: &[u8], blocks: &str) -> Vec<u8> {
+    let mut out = existing.to_vec();
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    if !out.is_empty() && *out.last().unwrap() != b'\n' {
+        out.push(b'\n');
+    }
+    out.extend_from_slice(blocks.as_bytes());
+    out.push(0);
+    out
+}
+
+fn push_f32s(out: &mut Vec<u8>, values: &[f32; 3]) {
+    for value in values {
+        out.extend(finite(*value).to_le_bytes());
+    }
 }
 
 fn paint(faces: &[FaceLight], light: &[[f32; 3]]) -> Result<(Vec<u8>, Vec<Patch>), Error> {

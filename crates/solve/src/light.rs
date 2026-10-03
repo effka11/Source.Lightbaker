@@ -2,11 +2,15 @@ use glam::Vec3;
 use rayon::prelude::*;
 
 use crate::embree::Scene;
-use crate::geom::{Area, Receiver, Role, Triangle};
+use crate::geom::{Area, Receiver, Role, Triangle, Volume};
 use crate::shell::sealed_areas;
 use crate::walls::WallIndex;
 
 const MIN_DISTANCE: f32 = 1.0e-2;
+/// Inverse square of a fist-sized patch with a fluorescent's intensity is a
+/// white point on its shell and black a step away. This radius keeps that
+/// near field finite. A sun disk is already wider, so it barely changes.
+pub const LAMP_REACH: f32 = 48.0;
 pub(crate) const RAY_LIFT: f32 = 0.5;
 const HIT_SLOP: f32 = 1.0e-3;
 const BOUNCES: u32 = 2;
@@ -135,9 +139,40 @@ pub fn faces_solid(triangles: &[Triangle], probes: &[(Vec3, Vec3)]) -> Vec<bool>
 }
 
 pub(crate) fn unoccluded_intensity(area: &Area, position: Vec3) -> f32 {
+    if let Area::Volume(volume) = area {
+        if !volume_contains(volume, position) {
+            return 0.0;
+        }
+        return volume.intensity / (LAMP_REACH * LAMP_REACH).max(MIN_DISTANCE);
+    }
     let nearest = nearest_point(area, position);
-    let distance = (nearest - position).length().max(MIN_DISTANCE);
-    area.intensity() / (distance * distance)
+    let distance = (nearest - position).length();
+    let reach = reach(area);
+    let denom = distance * distance + reach * reach;
+    area.intensity() / denom.max(MIN_DISTANCE)
+}
+
+fn volume_contains(volume: &Volume, point: Vec3) -> bool {
+    let offset = point - volume.center;
+    let inside = |axis: Vec3| {
+        let len2 = axis.length_squared();
+        len2 > 1.0e-8 && offset.dot(axis).abs() / len2 <= 1.0
+    };
+    inside(volume.axis_x) && inside(volume.axis_y) && inside(volume.axis_z)
+}
+
+fn reach(area: &Area) -> f32 {
+    let radius = match area {
+        Area::Rectangle(rectangle) => rectangle.half_u.length().hypot(rectangle.half_v.length()),
+        Area::Disk(disk) => disk.radius.max(0.0),
+        Area::Volume(_) => 0.0,
+        Area::Omni(omni) => omni
+            .axis_x
+            .length()
+            .max(omni.axis_y.length())
+            .max(omni.axis_z.length()),
+    };
+    radius.max(LAMP_REACH)
 }
 
 /// Direct light with the patch fully visible. No rays, bounce, or floor lift.
@@ -157,6 +192,155 @@ pub fn dynamic(receivers: &[Receiver], areas: &[Area]) -> Vec<[f32; 3]> {
         .collect()
 }
 
+/// Wider than a lamp. The sun and the moon are disks of this size; a
+/// fluorescent is not. One shadow ray keeps the wide patch out of a closed room.
+const BROAD: f32 = 128.0;
+
+pub fn broad(area: &Area) -> bool {
+    match area {
+        Area::Rectangle(rectangle) => {
+            rectangle.half_u.length().max(rectangle.half_v.length()) >= BROAD
+        }
+        Area::Disk(disk) => disk.radius >= BROAD,
+        Area::Volume(_) | Area::Omni(_) => false,
+    }
+}
+
+/// Triangles a wide light can be hidden by. Built once per map.
+pub struct Cover {
+    scene: Option<Scene>,
+}
+
+impl Cover {
+    pub fn new(triangles: &[Triangle]) -> Self {
+        Self {
+            scene: (!triangles.is_empty()).then(|| Scene::build(triangles)),
+        }
+    }
+
+    /// Fraction of each area seen by each receiver, row by receiver.
+    /// `0` is a closed room, `1` is a clear view of the patch.
+    pub fn see(&self, receivers: &[Receiver], areas: &[Area]) -> Vec<f32> {
+        let count = areas.len();
+        if receivers.is_empty() || count == 0 {
+            return Vec::new();
+        }
+        let mut seen = vec![0.0; receivers.len() * count];
+        let scene = self.scene.as_ref();
+        seen.par_chunks_mut(count)
+            .zip(receivers.par_iter())
+            .for_each(|(row, receiver)| {
+                for (index, area) in areas.iter().enumerate() {
+                    row[index] = fraction(scene, receiver, area);
+                }
+            });
+        seen
+    }
+}
+
+/// `seen` is the fraction from [`Cover::see`], one entry per receiver per area.
+pub fn broad_light(receivers: &[Receiver], areas: &[Area], seen: &[f32]) -> Vec<[f32; 3]> {
+    let count = areas.len();
+    if count == 0 || seen.len() != receivers.len() * count {
+        return vec![[0.0, 0.0, 0.0]; receivers.len()];
+    }
+    receivers
+        .par_iter()
+        .enumerate()
+        .map(|(index, receiver)| {
+            let mut sum = [0.0, 0.0, 0.0];
+            for (slot, area) in areas.iter().enumerate() {
+                let hit = seen[index * count + slot];
+                if hit <= 0.0 {
+                    continue;
+                }
+                let mut color = exposed(receiver, area);
+                color[0] *= hit;
+                color[1] *= hit;
+                color[2] *= hit;
+                add_color(&mut sum, color);
+            }
+            sum
+        })
+        .collect()
+}
+
+fn fraction(scene: Option<&Scene>, receiver: &Receiver, area: &Area) -> f32 {
+    let normal = receiver.normal.normalize_or_zero();
+    // The cavity is the lamp. A shell in the way must not turn it off.
+    if matches!(area, Area::Volume(_)) {
+        let lit = exposed(receiver, area);
+        return if lit[0] + lit[1] + lit[2] > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+    }
+    // Dimmer than this, the squared shader is black. Skip the ray.
+    if normal == Vec3::ZERO || unoccluded_intensity(area, receiver.position) < 1.0 / 64.0 {
+        return 0.0;
+    }
+    let origin = receiver.position + normal * RAY_LIFT;
+    if !area_reaches(origin, normal, area) {
+        return 0.0;
+    }
+    let Some(scene) = scene else {
+        return 1.0;
+    };
+    // A door frame covers a tiny patch completely, so every ray agrees and the
+    // luxel goes black. A lamp-sized spread leaves part of the disk clear.
+    let spread = penumbra(patch_span(area));
+    let samples = if spread > 0.0 { 9 } else { 4 };
+    let center = area.center();
+    let mut open = 0.0;
+    let mut used = 0.0;
+    for index in 0..samples {
+        let sample = if spread > 0.0 {
+            soft_sample(center, origin, spread, index, samples)
+        } else {
+            stratum_point(area, index, samples)
+        };
+        let delta = sample - origin;
+        let distance = delta.length();
+        if distance <= HIT_SLOP {
+            continue;
+        }
+        let direction = delta / distance;
+        // A sample that slips behind the patch is not a shadow. A figure has no face.
+        let lamp = area.normal();
+        if direction.dot(normal) <= 0.0 || (lamp != Vec3::ZERO && direction.dot(lamp) >= 0.0) {
+            continue;
+        }
+        used += 1.0;
+        if arrives(scene, origin, sample, normal, area) {
+            open += 1.0;
+        }
+    }
+    if used == 0.0 { 0.0 } else { open / used }
+}
+
+/// How far a lamp's shadow samples spread past the metal itself.
+/// A tiny patch stays tight so a bar still blocks, and the sun stays tight
+/// so the roof under it still blocks.
+fn penumbra(span: f32) -> f32 {
+    if span < 1.0 || span >= 128.0 {
+        0.0
+    } else {
+        48.0
+    }
+}
+
+fn soft_sample(center: Vec3, origin: Vec3, radius: f32, index: u32, rays: u32) -> Vec3 {
+    let direction = (center - origin).normalize_or_zero();
+    if direction == Vec3::ZERO {
+        return center;
+    }
+    let (axis, bitangent) = tangent_frame(direction);
+    let (u, v) = stratum_uv(index, rays);
+    let (x, y) = concentric_disk(u, v);
+    center + (axis * x + bitangent * y) * radius
+}
+
 fn exposed(receiver: &Receiver, area: &Area) -> [f32; 3] {
     let normal = receiver.normal.normalize_or_zero();
     let scale = unoccluded_intensity(area, receiver.position);
@@ -164,7 +348,12 @@ fn exposed(receiver: &Receiver, area: &Area) -> [f32; 3] {
         return [0.0, 0.0, 0.0];
     }
     let origin = receiver.position + normal * RAY_LIFT;
-    if !area_reaches(origin, normal, area) {
+    // The lift would walk a point on the shell out of a thin volume.
+    let reached = match area {
+        Area::Volume(_) => area_reaches(receiver.position, normal, area),
+        _ => area_reaches(origin, normal, area),
+    };
+    if !reached {
         return [0.0, 0.0, 0.0];
     }
     let color = area.color();
@@ -210,6 +399,9 @@ fn by_chunk<T: Send>(
 }
 
 fn direct(scene: &Scene, receiver: &Receiver, area: &Area, rays: u32) -> [f32; 3] {
+    if matches!(area, Area::Volume(_)) {
+        return exposed(receiver, area);
+    }
     let normal = receiver.normal.normalize_or_zero();
     let scale = unoccluded_intensity(area, receiver.position);
     if scale == 0.0 || normal == Vec3::ZERO {
@@ -223,7 +415,7 @@ fn direct(scene: &Scene, receiver: &Receiver, area: &Area, rays: u32) -> [f32; 3
     let mut hits = 0u32;
     for index in 0..rays {
         let sample = stratum_point(area, index, rays);
-        if arrives(scene, origin, sample, normal, area.normal()) {
+        if arrives(scene, origin, sample, normal, area) {
             hits += 1;
         }
     }
@@ -378,6 +570,8 @@ fn nearest_point(area: &Area, point: Vec3) -> Vec3 {
                 disk.center + axis * du * scale + bitangent * dv * scale
             }
         }
+        Area::Volume(volume) => volume.center,
+        Area::Omni(omni) => omni.center,
     }
 }
 
@@ -394,6 +588,8 @@ pub(crate) fn stratum_point(area: &Area, index: u32, rays: u32) -> Vec3 {
             let (axis, bitangent) = disk.frame();
             disk.center + axis * (x * disk.radius) + bitangent * (y * disk.radius)
         }
+        Area::Volume(volume) => volume.center,
+        Area::Omni(omni) => omni.center,
     }
 }
 
@@ -475,6 +671,27 @@ fn area_reaches(origin: Vec3, normal: Vec3, area: &Area) -> bool {
             let back = center.dot(lamp) - radius * planar_extent(axis, bitangent, lamp);
             back < 0.0
         }
+        Area::Volume(volume) => {
+            if !volume_contains(volume, origin) {
+                return false;
+            }
+            let toward = volume.center - origin;
+            if toward.length_squared() <= 1.0e-4 {
+                return true;
+            }
+            toward.normalize_or_zero().dot(normal) > 0.0
+        }
+        Area::Omni(omni) => {
+            // Inside the hull the volume is the lamp. Outside, any facing surface.
+            if in_axes(omni.center, [omni.axis_x, omni.axis_y, omni.axis_z], origin) {
+                return false;
+            }
+            let toward = omni.center - origin;
+            if toward.length_squared() <= 1.0e-4 {
+                return true;
+            }
+            toward.normalize_or_zero().dot(normal) > 0.0
+        }
     }
 }
 
@@ -482,12 +699,17 @@ fn planar_extent(axis: Vec3, bitangent: Vec3, direction: Vec3) -> f32 {
     (axis.dot(direction).powi(2) + bitangent.dot(direction).powi(2)).sqrt()
 }
 
+/// How far behind the patch the fixture body still counts as the lamp.
+const SHELL_BACK: f32 = 72.0;
+/// Leave the lit surface before counting a hit, so a graze is not a stripe.
+const RAY_SKIP: f32 = 1.0;
+
 fn arrives(
     scene: &Scene,
     origin: Vec3,
     sample: Vec3,
     receiver_normal: Vec3,
-    area_normal: Vec3,
+    area: &Area,
 ) -> bool {
     let delta = sample - origin;
     let distance = delta.length();
@@ -498,10 +720,130 @@ fn arrives(
     if direction.dot(receiver_normal) <= 0.0 {
         return false;
     }
-    if direction.dot(area_normal) >= 0.0 {
+    let lamp = area.normal();
+    if lamp != Vec3::ZERO && direction.dot(lamp) >= 0.0 {
         return false;
     }
-    !scene.occluded(origin, direction, distance - HIT_SLOP)
+    let limit = distance - HIT_SLOP;
+    if limit <= RAY_SKIP {
+        return true;
+    }
+    // A graze on the receiver is a stripe. The fixture and the brush it sits
+    // on are at the end of the ray; those hits are not a wall.
+    let start = origin + direction * RAY_SKIP;
+    let reach = limit - RAY_SKIP;
+    if !scene.occluded(start, direction, reach) {
+        return true;
+    }
+    match scene.hit(start, direction, reach) {
+        Some(hit) if on_source(area, hit.point) || near_lamp(area, hit.point) => true,
+        _ => false,
+    }
+}
+
+fn patch_span(area: &Area) -> f32 {
+    match area {
+        Area::Rectangle(rectangle) => rectangle.half_u.length().hypot(rectangle.half_v.length()),
+        Area::Disk(disk) => disk.radius.max(0.0),
+        Area::Volume(_) | Area::Omni(_) => 0.0,
+    }
+}
+
+/// In front of the patch. A tiny light stays tight so a nearby bar still
+/// blocks; a sun stays tight so the roof under it still blocks.
+fn source_front(span: f32) -> f32 {
+    if span < 1.0 {
+        2.0
+    } else if span >= 128.0 {
+        6.0
+    } else {
+        (span + 8.0).min(28.0)
+    }
+}
+
+/// Geometry this close to the sample is the lamp, even beside the rectangle.
+fn source_reach(span: f32) -> f32 {
+    if span < 1.0 {
+        4.0
+    } else if span >= 128.0 {
+        12.0
+    } else {
+        (span * 2.0 + 12.0).min(40.0)
+    }
+}
+
+fn near_lamp(area: &Area, hit: Vec3) -> bool {
+    let reach = source_reach(patch_span(area));
+    (hit - area.center()).length_squared() <= reach * reach
+}
+
+fn on_source(area: &Area, point: Vec3) -> bool {
+    match area {
+        Area::Rectangle(rectangle) => in_patch(
+            rectangle.center,
+            rectangle.normal,
+            rectangle.half_u,
+            rectangle.half_v,
+            point,
+        ),
+        Area::Disk(disk) => {
+            let normal = disk.normal.normalize_or_zero();
+            if normal == Vec3::ZERO || disk.radius <= 0.0 {
+                return false;
+            }
+            let offset = point - disk.center;
+            let along = offset.dot(normal);
+            if !shell_depth(disk.radius, along) {
+                return false;
+            }
+            // The rounded face still wears the rectangular cage around it.
+            (offset - normal * along).length() <= disk.radius * 2.0 + 4.0
+        }
+        Area::Volume(_) => false,
+        Area::Omni(omni) => in_axes_slack(
+            omni.center,
+            [omni.axis_x, omni.axis_y, omni.axis_z],
+            point,
+            2.0,
+        ),
+    }
+}
+
+fn in_axes(center: Vec3, axes: [Vec3; 3], point: Vec3) -> bool {
+    in_axes_slack(center, axes, point, 0.0)
+}
+
+fn in_axes_slack(center: Vec3, axes: [Vec3; 3], point: Vec3, slack: f32) -> bool {
+    let offset = point - center;
+    axes.iter().all(|axis| {
+        let len2 = axis.length_squared();
+        if len2 <= 1.0e-8 {
+            return false;
+        }
+        offset.dot(*axis).abs() <= len2 + slack * len2.sqrt()
+    })
+}
+
+fn in_patch(center: Vec3, normal: Vec3, half_u: Vec3, half_v: Vec3, point: Vec3) -> bool {
+    let normal = normal.normalize_or_zero();
+    let ulen = half_u.length_squared();
+    let vlen = half_v.length_squared();
+    if normal == Vec3::ZERO || ulen <= 1.0e-8 || vlen <= 1.0e-8 {
+        return false;
+    }
+    let offset = point - center;
+    let span = half_u.length().max(half_v.length());
+    if !shell_depth(span, offset.dot(normal)) {
+        return false;
+    }
+    let u = offset.dot(half_u) / ulen;
+    let v = offset.dot(half_v) / vlen;
+    u.abs() <= 2.0 && v.abs() <= 2.0
+}
+
+fn shell_depth(span: f32, along: f32) -> bool {
+    let back = (span * 3.0).max(SHELL_BACK);
+    along <= source_front(span) && along >= -back
 }
 
 fn tint(albedo: Vec3, energy: [f32; 3]) -> [f32; 3] {

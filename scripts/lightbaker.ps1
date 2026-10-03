@@ -4,7 +4,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$maps = "D:\Steam\steamapps\common\GarrysMod\garrysmod\maps"
+$root = "D:\Steam\steamapps\common\GarrysMod\garrysmod"
 
 if ([System.IO.Path]::IsPathRooted($Map)) {
     $bsp = $Map
@@ -13,7 +13,10 @@ if ([System.IO.Path]::IsPathRooted($Map)) {
     if (-not $name.EndsWith(".bsp")) {
         $name += ".bsp"
     }
-    $bsp = Join-Path $maps $name
+    $bsp = Join-Path $root "maps\$name"
+    if (-not (Test-Path -LiteralPath $bsp)) {
+        $bsp = Join-Path $root "download\maps\$name"
+    }
 }
 
 if (-not (Test-Path -LiteralPath $bsp)) {

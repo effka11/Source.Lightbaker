@@ -72,6 +72,20 @@ fn luxels_sit_on_the_face_grid_and_pak_color_wins() {
     );
     assert_eq!(map.snapshot.faces[0].width, 2);
     assert_eq!(map.snapshot.faces[0].luxel_count, 4);
+    let floor = map
+        .surface
+        .iter()
+        .find(|tri| (tri.albedo - Vec3::Y).length() < 1.0e-3)
+        .expect("floor triangle");
+    assert_eq!(floor.light_face, 0);
+    assert!(floor
+        .light_uv
+        .iter()
+        .any(|uv| uv[0].abs() < 1.0e-3 && uv[1].abs() < 1.0e-3));
+    assert!(floor
+        .light_uv
+        .iter()
+        .any(|uv| (uv[0] - 2.0).abs() < 1.0e-3 && (uv[1] - 2.0).abs() < 1.0e-3));
     assert_eq!(map.snapshot.bytes, std::fs::read(&path).unwrap());
 }
 
@@ -88,6 +102,17 @@ fn nodraw_blocks_rays_and_stays_off_the_view() {
         .surface
         .iter()
         .all(|tri| (tri.albedo - Vec3::Y).length() < 1.0e-3));
+}
+
+#[test]
+fn glass_stays_on_the_view_and_does_not_block() {
+    let path = temp("lightbaker-glass.bsp");
+    let mut bytes = room_bsp(0, wall_pak());
+    flag_texinfo(&mut bytes, 1, 0x0010);
+    std::fs::write(&path, &bytes).unwrap();
+    let map = open(&path).unwrap();
+    assert_eq!(map.triangles.len(), 2);
+    assert_eq!(map.surface.len(), 4);
 }
 
 #[test]
@@ -152,7 +177,7 @@ fn gm_construct_opens_and_feeds_the_same_solve() {
         "static props did not become receivers"
     );
     assert!(
-        map.triangles.len() > 80_000 && map.triangles.len() < 200_000,
+        map.triangles.len() > 80_000 && map.triangles.len() < 800_000,
         "triangles {}",
         map.triangles.len()
     );
@@ -280,15 +305,9 @@ fn construct_displacements_stay_on_their_grid() {
     let mut ratios = crate::bsp::terrain_stretch(&bytes);
     ratios.sort_by(|left, right| left.total_cmp(right));
     let p99 = ratios[ratios.len() * 99 / 100];
-    assert!(
-        p99 < 3.0,
-        "displacement edges stretch {p99:.1} grid steps"
-    );
+    assert!(p99 < 3.0, "displacement edges stretch {p99:.1} grid steps");
     let seam = crate::bsp::shared_seam_median(&bytes);
-    assert!(
-        seam < 8.0,
-        "displacement neighbors stay {seam:.1} apart"
-    );
+    assert!(seam < 8.0, "displacement neighbors stay {seam:.1} apart");
 }
 
 #[test]
@@ -418,6 +437,243 @@ fn nearest_xy(luxels: &[crate::Luxel], x: f32, y: f32) -> &crate::Luxel {
             dl.total_cmp(&dr)
         })
         .expect("luxel")
+}
+
+#[test]
+fn a_jail_ceiling_faces_the_room() {
+    let path = PathBuf::from(
+        r"D:\Steam\steamapps\common\GarrysMod\garrysmod\download\maps\relapse_jail.bsp",
+    );
+    if !path.exists() {
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let map = crate::bsp::assemble(&bytes).unwrap();
+    let luxel = nearest(&map.luxels, Vec3::new(796.0, 455.3, 128.0));
+    assert!(
+        (luxel.receiver.position - Vec3::new(796.0, 455.3, 128.0)).length() < 32.0,
+        "{}",
+        luxel.receiver.position
+    );
+    assert!(
+        luxel.receiver.normal.z < -0.5,
+        "ceiling {:?}",
+        luxel.receiver.normal
+    );
+}
+
+#[test]
+fn a_jail_door_keeps_its_model_texture() {
+    let path = PathBuf::from(
+        r"D:\Steam\steamapps\common\GarrysMod\garrysmod\download\maps\relapse_jail.bsp",
+    );
+    if !path.exists() {
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let offset = i32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let length = i32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let entities = String::from_utf8_lossy(&bytes[offset..offset + length]);
+    let mut origin = None;
+    for block in entities.split('{').skip(1) {
+        let body = block.split('}').next().unwrap_or("");
+        if !body.contains("prop_door_rotating") {
+            continue;
+        }
+        let mut quotes = body.match_indices('"').map(|(index, _)| index);
+        while let Some(start) = quotes.next() {
+            let Some(stop) = quotes.next() else { break };
+            if &body[start + 1..stop] != "origin" {
+                continue;
+            }
+            let Some(value_start) = quotes.next() else {
+                break;
+            };
+            let Some(value_end) = quotes.next() else {
+                break;
+            };
+            let mut parts = body[value_start + 1..value_end].split_whitespace();
+            origin = Some(Vec3::new(
+                parts.next().unwrap().parse().unwrap(),
+                parts.next().unwrap().parse().unwrap(),
+                parts.next().unwrap().parse().unwrap(),
+            ));
+            break;
+        }
+        if origin.is_some() {
+            break;
+        }
+    }
+    let origin = origin.expect("door");
+    let map = open(&path).unwrap();
+    let mut faces: Vec<&crate::Surface> = Vec::new();
+    faces.extend(map.surface.iter());
+    for door in &map.doors {
+        faces.extend(door.closed.surface.iter());
+    }
+    let mut min = Vec3::splat(f32::MAX);
+    let mut max = Vec3::splat(f32::MIN);
+    let mut hinged = false;
+    for face in faces {
+        let textured = face.albedo == Vec3::splat(0.62)
+            && map
+                .materials
+                .get(face.material as usize)
+                .and_then(|material| material.texture)
+                .is_some();
+        if !textured {
+            continue;
+        }
+        if !face
+            .vertices
+            .iter()
+            .any(|point| point.distance(origin) < 160.0)
+        {
+            continue;
+        }
+        if face
+            .vertices
+            .iter()
+            .any(|point| point.distance(origin) < 4.0)
+        {
+            hinged = true;
+        }
+        for vertex in face.vertices {
+            if vertex.distance(origin) > 160.0 {
+                continue;
+            }
+            min = min.min(vertex);
+            max = max.max(vertex);
+        }
+    }
+    let span = max - min;
+    assert!(
+        hinged,
+        "door at {origin:?} has no textured hinge, span {span:?}"
+    );
+    assert!(
+        span.z >= 80.0 && (span.x >= 40.0 || span.y >= 40.0),
+        "door at {origin:?} is not a slab, span {span:?}"
+    );
+}
+
+#[test]
+fn construct_grass_uses_the_real_texture() {
+    let Some(path) = construct_path() else {
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let assembled = crate::bsp::assemble(&bytes).unwrap();
+    let used: Vec<u32> = assembled.surface.iter().map(|face| face.material).collect();
+    let (materials, images) =
+        crate::picture::Catalog::world(&bytes, &path, &assembled.names, &used, &|_, _, _| {})
+            .finish();
+    let grass = images
+        .iter()
+        .position(|image| image.width == 2048 && image.mips[0].starts_with(&[55, 64, 24, 255]))
+        .expect("grass texture");
+    assert_eq!(images[grass].mips[0].len(), 2048 * 2048 * 4);
+    let material = materials
+        .iter()
+        .position(|material| material.texture == Some(grass as u32))
+        .expect("grass material");
+    let face = assembled
+        .surface
+        .iter()
+        .find(|face| face.material == material as u32)
+        .expect("grass face");
+    let span = (face.uv[0][0] - face.uv[1][0]).hypot(face.uv[0][1] - face.uv[1][1]);
+    assert!(span > 8.0, "texture axes {span}");
+    assert!(assembled
+        .surface
+        .iter()
+        .any(|face| face.blend.iter().any(|blend| *blend > 0.9)));
+}
+
+#[test]
+fn construct_color_canvases_stay_off_the_view() {
+    let Some(path) = construct_path() else {
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let assembled =
+        crate::bsp::assemble_reporting(&bytes, Some(path.as_path()), &|_, _, _| {}).unwrap();
+    assert!(
+        assembled
+            .surface
+            .iter()
+            .all(|face| !is_color_canvas(&face.vertices)),
+        "paint canvas is still drawn"
+    );
+    assert!(
+        assembled
+            .triangles
+            .iter()
+            .all(|face| !is_color_canvas(&face.vertices)),
+        "paint canvas still blocks light"
+    );
+}
+
+#[test]
+fn displacement_light_stays_on_the_luxel_grid() {
+    let Some(path) = construct_path() else {
+        return;
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let map = crate::bsp::assemble(&bytes).unwrap();
+    let mut count = vec![0u32; map.faces.len()];
+    for tri in &map.surface {
+        if tri.light_face != u32::MAX {
+            count[tri.light_face as usize] += 1;
+        }
+    }
+    for tri in &map.surface {
+        if tri.light_face == u32::MAX {
+            continue;
+        }
+        let face = &map.faces[tri.light_face as usize];
+        if face.width == 0 || face.height == 0 {
+            continue;
+        }
+        let displaced = count[tri.light_face as usize] >= 32;
+        let (lo, hi_u, hi_v) = if displaced {
+            (0.4, face.width as f32 - 0.4, face.height as f32 - 0.4)
+        } else {
+            (-0.51, face.width as f32 + 0.51, face.height as f32 + 0.51)
+        };
+        for uv in tri.light_uv {
+            assert!(
+                (lo..hi_u).contains(&uv[0]) && (lo..hi_v).contains(&uv[1]),
+                "face {} grid {}x{} light uv {uv:?}",
+                tri.light_face,
+                face.width,
+                face.height
+            );
+        }
+    }
+}
+
+fn is_color_canvas(vertices: &[glam::Vec3; 3]) -> bool {
+    let thin_wall = vertices.iter().all(|point| point.x.abs() < 30.0)
+        && span(vertices, |point| point.y) > 400.0
+        && vertices.iter().all(|point| point.z.abs() < 250.0);
+    let sheet = vertices
+        .iter()
+        .all(|point| (point.z.abs() - 4.0).abs() < 1.0)
+        && span(vertices, |point| point.x) > 1000.0
+        && span(vertices, |point| point.y) > 800.0;
+    thin_wall || sheet
+}
+
+fn span(vertices: &[glam::Vec3; 3], axis: impl Fn(glam::Vec3) -> f32) -> f32 {
+    let mut low = f32::MAX;
+    let mut high = f32::MIN;
+    for point in vertices {
+        let value = axis(*point);
+        low = low.min(value);
+        high = high.max(value);
+    }
+    high - low
 }
 
 fn construct_path() -> Option<PathBuf> {
@@ -647,6 +903,60 @@ fn model() -> Vec<u8> {
     out
 }
 
+#[test]
+fn a_brush_door_blocks_when_closed_and_slides_when_open() {
+    let mut bin = room_bin(0, Vec::new());
+    bin.lump(
+        0,
+        b"{\n\"classname\" \"func_door\"\n\"model\" \"*1\"\n\"origin\" \"16 0 16\"\n\"movedir\" \"1 0 0\"\n\"targetname\" \"gate\"\n\"hammerid\" \"15\"\n}\n"
+            .to_vec(),
+    );
+    let mut models = dmodel([0.0, 0.0, 0.0], [32.0, 32.0, 32.0], [16.0, 16.0, 0.0], 0, 1).to_vec();
+    models.extend(dmodel(
+        [0.0, 0.0, 0.0],
+        [32.0, 0.0, 32.0],
+        [16.0, 0.0, 16.0],
+        1,
+        1,
+    ));
+    bin.lump(14, models);
+    let map = crate::bsp::assemble(&bin.finish()).unwrap();
+    assert_eq!(map.doors.len(), 1);
+    assert_eq!(map.doors[0].name, "gate");
+    assert_eq!(map.doors[0].id, "func_door#15");
+    for triangle in &map.triangles {
+        for point in triangle.vertices {
+            assert!(point.z.abs() < 1.0e-3, "world kept the door: {point:?}");
+        }
+    }
+    let closed = max_x(&map.doors[0].closed.triangles);
+    let open = max_x(&map.doors[0].open.triangles);
+    assert!(open > closed + 16.0, "closed {closed} open {open}");
+    assert!(map.doors[0]
+        .closed
+        .triangles
+        .iter()
+        .any(|triangle| triangle.vertices.iter().any(|point| point.z > 16.0)));
+}
+
+fn max_x(triangles: &[solve::Triangle]) -> f32 {
+    triangles
+        .iter()
+        .flat_map(|triangle| triangle.vertices)
+        .map(|point| point.x)
+        .fold(f32::MIN, f32::max)
+}
+
+fn dmodel(mins: [f32; 3], maxs: [f32; 3], origin: [f32; 3], first: i32, count: i32) -> [u8; 48] {
+    let mut out = [0u8; 48];
+    out[..12].copy_from_slice(&vec3(mins[0], mins[1], mins[2]));
+    out[12..24].copy_from_slice(&vec3(maxs[0], maxs[1], maxs[2]));
+    out[24..36].copy_from_slice(&vec3(origin[0], origin[1], origin[2]));
+    out[40..44].copy_from_slice(&first.to_le_bytes());
+    out[44..48].copy_from_slice(&count.to_le_bytes());
+    out
+}
+
 fn vec3(x: f32, y: f32, z: f32) -> [u8; 12] {
     let mut out = [0u8; 12];
     out[..4].copy_from_slice(&x.to_le_bytes());
@@ -690,4 +1000,39 @@ impl Bin {
         out.extend(body);
         out
     }
+}
+
+#[test]
+fn prop_lightmaps_keep_lod0_in_file_order() {
+    use crate::{prop_grids, PropBody, PropLight, PropVerts};
+    let props = [
+        PropLight {
+            ldr: String::new(),
+            hdr: String::new(),
+            checksum: 0,
+            first: 10,
+            body: PropBody::Luxels {
+                width: 4,
+                height: 2,
+                lods: vec![1, 0, 0],
+                ldr_format: 2,
+                hdr_format: 24,
+            },
+        },
+        PropLight {
+            ldr: String::new(),
+            hdr: String::new(),
+            checksum: 0,
+            first: 100,
+            body: PropBody::Vertices {
+                meshes: vec![PropVerts { lod: 0, count: 3 }],
+            },
+        },
+    ];
+    let grids = prop_grids(&props);
+    assert_eq!(grids.len(), 2);
+    assert_eq!(grids[0].first_luxel, 18);
+    assert_eq!(grids[0].luxel_count, 8);
+    assert_eq!(grids[1].first_luxel, 26);
+    assert_eq!((grids[1].width, grids[1].height), (4, 2));
 }

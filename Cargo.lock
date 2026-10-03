@@ -3409,6 +3409,7 @@ dependencies = [
  "glam",
  "lamps",
  "map",
+ "naga",
  "rfd",
  "serde",
  "serde_json",

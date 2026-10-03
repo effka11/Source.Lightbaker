@@ -72,11 +72,39 @@ impl Disk {
     }
 }
 
+/// Oriented box. Points inside are the lamp; the shell does not leave a cavity.
+#[derive(Clone, Copy, Debug)]
+pub struct Volume {
+    pub center: Vec3,
+    /// Half-extent along the box X axis, in world space.
+    pub axis_x: Vec3,
+    /// Half-extent along the box Y axis, in world space.
+    pub axis_y: Vec3,
+    /// Half-extent along the box Z axis, in world space.
+    pub axis_z: Vec3,
+    pub intensity: f32,
+    pub color: Vec3,
+}
+
+/// Light at the center of a solid figure. No face, so the hull does not cut the room.
+#[derive(Clone, Copy, Debug)]
+pub struct Omni {
+    pub center: Vec3,
+    /// Half-extent along the box X axis. Geometry inside the box is the figure.
+    pub axis_x: Vec3,
+    pub axis_y: Vec3,
+    pub axis_z: Vec3,
+    pub intensity: f32,
+    pub color: Vec3,
+}
+
 /// Emitting patch handed to the solver.
 #[derive(Clone, Copy, Debug)]
 pub enum Area {
     Rectangle(Rectangle),
     Disk(Disk),
+    Volume(Volume),
+    Omni(Omni),
 }
 
 impl Area {
@@ -84,6 +112,8 @@ impl Area {
         match self {
             Area::Rectangle(rectangle) => rectangle.center,
             Area::Disk(disk) => disk.center,
+            Area::Volume(volume) => volume.center,
+            Area::Omni(omni) => omni.center,
         }
     }
 
@@ -91,6 +121,7 @@ impl Area {
         match self {
             Area::Rectangle(rectangle) => rectangle.normal,
             Area::Disk(disk) => disk.normal,
+            Area::Volume(_) | Area::Omni(_) => Vec3::ZERO,
         }
     }
 
@@ -98,6 +129,8 @@ impl Area {
         match self {
             Area::Rectangle(rectangle) => rectangle.intensity,
             Area::Disk(disk) => disk.intensity,
+            Area::Volume(volume) => volume.intensity,
+            Area::Omni(omni) => omni.intensity,
         }
     }
 
@@ -105,6 +138,8 @@ impl Area {
         match self {
             Area::Rectangle(rectangle) => rectangle.color,
             Area::Disk(disk) => disk.color,
+            Area::Volume(volume) => volume.color,
+            Area::Omni(omni) => omni.color,
         }
     }
 }

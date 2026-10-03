@@ -151,14 +151,14 @@ mod tests {
     fn as_rectangle(area: Area) -> Rectangle {
         match area {
             Area::Rectangle(rectangle) => rectangle,
-            Area::Disk(_) => panic!("expected a rectangle"),
+            Area::Disk(_) | Area::Volume(_) | Area::Omni(_) => panic!("expected a rectangle"),
         }
     }
 
     fn as_disk(area: Area) -> Disk {
         match area {
             Area::Disk(disk) => disk,
-            Area::Rectangle(_) => panic!("expected a disk"),
+            Area::Rectangle(_) | Area::Volume(_) | Area::Omni(_) => panic!("expected a disk"),
         }
     }
 

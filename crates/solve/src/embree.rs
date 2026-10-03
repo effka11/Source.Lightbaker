@@ -87,6 +87,7 @@ unsafe extern "C" {
 
     fn rtcNewScene(device: Device) -> ScenePtr;
     fn rtcReleaseScene(scene: ScenePtr);
+    fn rtcSetSceneFlags(scene: ScenePtr, flags: i32);
     fn rtcCommitScene(scene: ScenePtr);
     fn rtcAttachGeometry(scene: ScenePtr, geometry: Geometry) -> u32;
 
@@ -161,6 +162,9 @@ impl Scene {
             check(device);
             panic!("Embree rtcNewScene returned null");
         }
+        // Without this, a ray aimed at a textured wall slips through the
+        // crack between two triangles and the light shows up on the far side.
+        unsafe { rtcSetSceneFlags(scene, 1 << 2) };
 
         let mut vertices = Vec::with_capacity(triangles.len() * 9);
         let mut indices = Vec::with_capacity(triangles.len() * 3);

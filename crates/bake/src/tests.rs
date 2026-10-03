@@ -192,7 +192,7 @@ fn grate_blocks_a_stripe_and_prop_light_replaces_only_the_pak() {
     for sample in &mut light[12..] {
         *sample = [0.0, 1.0, 0.0];
     }
-    write::write(&map.snapshot, &light, &source, &dest).unwrap();
+    write::write(&map.snapshot, &light, &[], &source, &dest).unwrap();
     assert_eq!(std::fs::read(&source).unwrap(), original);
 
     let written = std::fs::read(&dest).unwrap();

@@ -19,3 +19,6 @@ solve = { path = "../solve" }
 lamps = { path = "../lamps" }
 map = { path = "../map" }
 bake = { path = "../bake" }
+
+[dev-dependencies]
+naga = "25"

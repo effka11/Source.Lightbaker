@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 struct Entry {
@@ -61,10 +61,7 @@ fn pack_paths(map_path: &Path) -> Vec<PathBuf> {
                     continue;
                 };
                 let lower = name.to_ascii_lowercase();
-                if !lower.ends_with("_dir.vpk")
-                    || lower.contains("sound")
-                    || lower.contains("texture")
-                {
+                if !lower.ends_with("_dir.vpk") || lower.contains("sound") {
                     continue;
                 }
                 paths.push(path);
@@ -72,6 +69,11 @@ fn pack_paths(map_path: &Path) -> Vec<PathBuf> {
         }
         dir = current.parent();
     }
+    paths.sort_by_key(|path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.to_ascii_lowercase().contains("fallback"))
+    });
     paths
 }
 
@@ -165,7 +167,7 @@ fn open_reporting(
                 let lower = key.to_ascii_lowercase();
                 if matches!(
                     lower.rsplit('.').next(),
-                    Some("mdl" | "vvd" | "vtx" | "ppl" | "vhv")
+                    Some("mdl" | "vvd" | "vtx" | "ppl" | "vhv" | "vmt" | "vtf")
                 ) {
                     files.insert(
                         lower,
@@ -200,15 +202,19 @@ impl Pack {
             let replaced = name.replacen("_dir.vpk", &format!("_{:03}.vpk", entry.archive), 1);
             self.dir.with_file_name(replaced)
         };
-        let data = fs::read(&file).ok()?;
+        let mut handle = File::open(file).ok()?;
         let start = if entry.archive == 0x7fff {
-            let tree = u32_at(&data, 8)? as usize;
-            28 + tree + entry.offset as usize
+            let mut header = [0u8; 12];
+            handle.read_exact(&mut header).ok()?;
+            let tree = u32::from_le_bytes(header[8..12].try_into().ok()?) as u64;
+            28 + tree + entry.offset as u64
         } else {
-            entry.offset as usize
+            entry.offset as u64
         };
-        let end = start + entry.length as usize;
-        bytes.extend(data.get(start..end)?);
+        handle.seek(SeekFrom::Start(start)).ok()?;
+        let mut rest = vec![0u8; entry.length as usize];
+        handle.read_exact(&mut rest).ok()?;
+        bytes.extend(rest);
         Some(bytes)
     }
 }
