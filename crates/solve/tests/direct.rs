@@ -12,6 +12,7 @@ fn ceiling_light() -> Area {
         normal: -Vec3::Z,
         intensity: 100.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     })
 }
 
@@ -57,6 +58,7 @@ fn a_wide_disk_stops_on_the_ceiling_and_a_lamp_does_not() {
         axis: Vec3::X,
         intensity: 8_000_000.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     });
     let floor = upward(Vec3::ZERO);
     let beside = upward(Vec3::new(80.0, 0.0, 0.0));
@@ -76,6 +78,60 @@ fn a_wide_disk_stops_on_the_ceiling_and_a_lamp_does_not() {
     assert_eq!(colors[2], [0.0, 0.0, 0.0]);
 }
 
+#[test]
+fn the_moon_does_not_cross_the_ceiling_onto_a_frame() {
+    let moon = Area::Disk(Disk {
+        center: Vec3::new(40.0, 0.0, 200.0),
+        radius: 200.0,
+        normal: -Vec3::Z,
+        axis: Vec3::X,
+        intensity: 440_000.0,
+        color: Vec3::new(0.55, 0.70, 1.0),
+        reach: 12_288.0,
+    });
+    let top = Receiver {
+        position: Vec3::new(0.0, 0.0, 31.0),
+        normal: Vec3::Z,
+        albedo: Vec3::ONE,
+        role: Role::Floor,
+    };
+    let bar = Receiver {
+        position: Vec3::new(0.0, 0.0, 31.2),
+        normal: Vec3::X,
+        albedo: Vec3::ONE,
+        role: Role::Wall,
+    };
+    // The header has crossed the slab. It still belongs to the room below.
+    let poked = Receiver {
+        position: Vec3::new(0.0, 0.0, 32.6),
+        normal: Vec3::Z,
+        albedo: Vec3::ONE,
+        role: Role::Floor,
+    };
+    let yard = upward(Vec3::new(800.0, 0.0, 31.0));
+    let ceiling = downward_quad(32.0, -400.0, 400.0, -400.0, 400.0);
+    let seen = Cover::new(&ceiling).see(&[top, bar, poked, yard], &[moon]);
+    assert_eq!(seen[0], 0.0, "top of the frame {}", seen[0]);
+    assert_eq!(seen[1], 0.0, "bar under the ceiling {}", seen[1]);
+    assert_eq!(seen[2], 0.0, "header through the slab {}", seen[2]);
+    assert!(seen[3] > 0.0, "open yard {}", seen[3]);
+}
+
+fn downward_quad(z: f32, x0: f32, x1: f32, y0: f32, y1: f32) -> Vec<solve::Triangle> {
+    let a = Vec3::new(x0, y0, z);
+    let b = Vec3::new(x0, y1, z);
+    let c = Vec3::new(x1, y1, z);
+    let d = Vec3::new(x1, y0, z);
+    vec![
+        solve::Triangle {
+            vertices: [a, b, c],
+        },
+        solve::Triangle {
+            vertices: [a, c, d],
+        },
+    ]
+}
+
 fn high_lamp() -> Area {
     Area::Rectangle(Rectangle {
         center: Vec3::new(0.0, 0.0, 80.0),
@@ -84,6 +140,7 @@ fn high_lamp() -> Area {
         normal: -Vec3::Z,
         intensity: 100.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     })
 }
 
@@ -124,6 +181,7 @@ fn a_figure_does_not_cut_the_wall_it_sits_on() {
         axis_z: Vec3::new(0.0, 0.0, 8.0),
         intensity: 18_000.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     });
     let mount = vertical(0.0);
     let beside = Receiver {
@@ -171,8 +229,12 @@ fn vertical_span(x: f32, y0: f32, y1: f32, z0: f32, z1: f32) -> Vec<solve::Trian
     let c = Vec3::new(x, y1, z1);
     let d = Vec3::new(x, y0, z1);
     vec![
-        solve::Triangle { vertices: [a, b, c] },
-        solve::Triangle { vertices: [a, c, d] },
+        solve::Triangle {
+            vertices: [a, b, c],
+        },
+        solve::Triangle {
+            vertices: [a, c, d],
+        },
     ]
 }
 
@@ -241,13 +303,19 @@ fn visibility_is_open_closed_or_partial() {
         normal: -Vec3::Z,
         intensity: 100.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     });
     let receiver = upward(Vec3::ZERO);
 
     let open = light(&[], &[receiver], &area, 16);
     assert!(open[0][0] > 0.0, "{}", open[0][0]);
 
-    let closed = light(&quad(10.0, -20.0, 20.0, -20.0, 20.0), &[receiver], &area, 16);
+    let closed = light(
+        &quad(10.0, -20.0, 20.0, -20.0, 20.0),
+        &[receiver],
+        &area,
+        16,
+    );
     assert_eq!(closed[0], [0.0, 0.0, 0.0]);
 
     let partial = light(&quad(10.0, 0.0, 20.0, -20.0, 20.0), &[receiver], &area, 16);
@@ -285,8 +353,16 @@ fn patch_color_scales_each_channel() {
     rectangle.color = Vec3::new(0.25, 0.5, 0.0);
     let colors = light(&[], &[upward(Vec3::ZERO)], &Area::Rectangle(rectangle), 8);
     let scale = 100.0 / (10.0 * 10.0 + 48.0 * 48.0);
-    assert!((colors[0][0] - 0.25 * scale).abs() < 1.0e-4, "{}", colors[0][0]);
-    assert!((colors[0][1] - 0.5 * scale).abs() < 1.0e-4, "{}", colors[0][1]);
+    assert!(
+        (colors[0][0] - 0.25 * scale).abs() < 1.0e-4,
+        "{}",
+        colors[0][0]
+    );
+    assert!(
+        (colors[0][1] - 0.5 * scale).abs() < 1.0e-4,
+        "{}",
+        colors[0][1]
+    );
     assert_eq!(colors[0][2], 0.0);
 }
 
@@ -299,6 +375,7 @@ fn disk_falls_off_from_the_rim() {
         axis: Vec3::X,
         intensity: 100.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     });
     let under = light(&[], &[upward(Vec3::ZERO)], &disk, 16);
     let reach = 48.0 * 48.0;
@@ -327,6 +404,7 @@ fn the_inside_of_a_lamp_stays_lit_through_its_shell() {
         axis_z: Vec3::Z * 8.0,
         intensity: 3000.0,
         color: Vec3::new(1.0, 0.5, 0.25),
+        reach: LAMP_REACH,
     });
     let inside = Receiver {
         position: Vec3::new(0.0, 0.0, 6.0),
@@ -351,4 +429,124 @@ fn the_inside_of_a_lamp_stays_lit_through_its_shell() {
     assert_eq!(colors[2], [0.0, 0.0, 0.0]);
     let seen = Cover::new(&shell).see(&[inside], &[volume]);
     assert_eq!(seen, vec![1.0]);
+}
+
+#[test]
+fn a_longer_reach_holds_eight_feet_out_and_carries_past_it() {
+    let patch = |reach: f32| {
+        Area::Rectangle(Rectangle {
+            center: Vec3::new(0.0, 0.0, 96.0),
+            half_u: Vec3::new(1.0, 0.0, 0.0),
+            half_v: Vec3::new(0.0, 1.0, 0.0),
+            normal: -Vec3::Z,
+            intensity: 18_000.0,
+            color: Vec3::ONE,
+            reach,
+        })
+    };
+    let under = upward(Vec3::ZERO);
+    let short = light(&[], &[under], &patch(LAMP_REACH), 8);
+    let long = light(&[], &[under], &patch(192.0), 8);
+    assert!(
+        (short[0][0] - long[0][0]).abs() < 1.0e-3,
+        "eight feet {} vs {}",
+        short[0][0],
+        long[0][0]
+    );
+
+    let beside = upward(Vec3::new(300.0, 0.0, 0.0));
+    let short_far = light(&[], &[beside], &patch(LAMP_REACH), 8);
+    let long_far = light(&[], &[beside], &patch(192.0), 8);
+    assert!(
+        long_far[0][0] > short_far[0][0] * 2.0,
+        "far {} vs {}",
+        long_far[0][0],
+        short_far[0][0]
+    );
+
+    let close = upward(Vec3::new(0.0, 0.0, 90.0));
+    let short_near = light(&[], &[close], &patch(LAMP_REACH), 8);
+    let long_near = light(&[], &[close], &patch(192.0), 8);
+    assert!(
+        long_near[0][0] < short_near[0][0] * 0.6,
+        "near {} vs {}",
+        long_near[0][0],
+        short_near[0][0]
+    );
+}
+
+#[test]
+fn reach_keeps_the_anchor_and_extends_the_pool() {
+    let anchor = upward(Vec3::ZERO);
+    let far = upward(Vec3::new(400.0, 0.0, 0.0));
+    let lamp = |reach: f32| {
+        Area::Rectangle(Rectangle {
+            center: Vec3::new(0.0, 0.0, 96.0),
+            half_u: Vec3::X,
+            half_v: Vec3::Y,
+            normal: -Vec3::Z,
+            intensity: 18_000.0,
+            color: Vec3::ONE,
+            reach,
+        })
+    };
+    let short = light(&[], &[anchor, far], &lamp(LAMP_REACH), 8);
+    let long = light(&[], &[anchor, far], &lamp(192.0), 8);
+    let expected = 18_000.0 / (96.0 * 96.0 + LAMP_REACH * LAMP_REACH);
+    assert!(
+        (short[0][0] - expected).abs() < 1.0e-3,
+        "anchor {}",
+        short[0][0]
+    );
+    assert!(
+        (short[0][0] - long[0][0]).abs() < 1.0e-3,
+        "anchor moved: {} vs {}",
+        short[0][0],
+        long[0][0]
+    );
+    assert!(
+        long[1][0] > short[1][0] * 2.0,
+        "far {} vs {}",
+        long[1][0],
+        short[1][0]
+    );
+}
+
+#[test]
+fn a_disk_as_wide_as_its_reach_keeps_its_size() {
+    let disk = Area::Disk(Disk {
+        center: Vec3::new(0.0, 0.0, 100.0),
+        radius: 512.0,
+        normal: -Vec3::Z,
+        axis: Vec3::X,
+        intensity: 8_000_000.0,
+        color: Vec3::ONE,
+        reach: 512.0,
+    });
+    let colors = light(&[], &[upward(Vec3::ZERO)], &disk, 4);
+    let expected = 8_000_000.0 / (100.0 * 100.0 + 512.0 * 512.0);
+    assert!(
+        (colors[0][0] - expected).abs() < 1.0,
+        "{} vs {expected}",
+        colors[0][0]
+    );
+}
+
+#[test]
+fn a_point_just_inside_a_slab_steps_out_and_a_deep_one_stays_dark() {
+    let slab = quad(0.0, -40.0, 40.0, -40.0, 40.0);
+    let lamp = Area::Rectangle(Rectangle {
+        center: Vec3::new(0.0, 0.0, 80.0),
+        half_u: Vec3::new(5.0, 0.0, 0.0),
+        half_v: Vec3::new(0.0, 1.0, 0.0),
+        normal: -Vec3::Z,
+        intensity: 20_000.0,
+        color: Vec3::ONE,
+        reach: LAMP_REACH,
+    });
+    let buried = upward(Vec3::new(0.0, 0.0, -1.0));
+    let deep = upward(Vec3::new(0.0, 0.0, -20.0));
+    let colors = light(&slab, &[buried, deep], &lamp, 8);
+    assert!(colors[0][0] > 0.0, "buried {:?}", colors[0]);
+    assert_eq!(colors[1], [0.0, 0.0, 0.0], "deep {:?}", colors[1]);
 }

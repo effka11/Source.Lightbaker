@@ -11,10 +11,35 @@ const HEADER: usize = 8 + 64 * 16 + 4;
 #[test]
 fn color_packs_into_the_engine_sample() {
     assert_eq!(unpack(pack_sample([0.0, 0.0, 0.0])), [0.0, 0.0, 0.0]);
-    assert_eq!(unpack(pack_sample([1.0, 0.0, 0.0])), [1.0, 0.0, 0.0]);
-    assert_eq!(unpack(pack_sample([1.0, -4.0, 0.0])), [1.0, 0.0, 0.0]);
-    near(unpack(pack_sample([0.5, 0.25, 0.125])), [0.5, 0.25, 0.125]);
-    assert_eq!(unpack(pack_sample([2.0, 2.0, 2.0])), [2.0, 2.0, 2.0]);
+    let folded = unpack(pack_sample([0.2, 0.1, 0.0]));
+    assert!(folded[0] < 0.08 && folded[0] > 0.02, "{folded:?}");
+    assert!(folded[1] < folded[0] && folded[1] > 0.0, "{folded:?}");
+    assert_eq!(folded[2], 0.0);
+    let byte = [0.45, 0.32, 0.20];
+    let light = [0.8, 0.3, 0.1];
+    let stored = super::engine_linear(light, byte);
+    assert!(stored.iter().all(|channel| *channel <= 4.0), "{stored:?}");
+    let display = super::screen([byte[0] * light[0], byte[1] * light[1], byte[2] * light[2]])
+        .map(super::srgb_encode);
+    for index in 0..3 {
+        let game = byte[index] * stored[index].powf(1.0 / 2.2);
+        assert!(
+            (game - display[index]).abs() < 1.0e-4,
+            "{game} vs {}",
+            display[index]
+        );
+    }
+    let dark = [0.15, 0.12, 0.08];
+    let lamp = super::engine_linear([100.0, 80.0, 40.0], dark);
+    assert!(lamp[0] <= 4.0, "{lamp:?}");
+    let shown = dark[0] * lamp[0].powf(1.0 / 2.2);
+    let buried = dark[0] * super::srgb_encode(super::screen([dark[0] * 100.0, 0.0, 0.0])[0]);
+    assert!(shown > buried + 0.05, "{shown} vs {buried}");
+    assert_eq!(unpack(pack_sample([1.0, -4.0, 0.0]))[1], 0.0);
+    let modest = unpack(pack_sample([1.0, 0.0, 0.0]));
+    let hot = unpack(pack_sample([4.0, 4.0, 4.0]));
+    assert!(modest[0] < 1.0 && modest[0] > 0.4, "{modest:?}");
+    assert!(hot[0] < 1.0 && hot[0] > modest[0], "{hot:?} vs {modest:?}");
     assert_eq!(
         unpack(pack_sample([f32::NAN, f32::INFINITY, 0.0])),
         [0.0, 0.0, 0.0]
@@ -29,7 +54,7 @@ fn the_source_path_is_refused_and_the_file_stays() {
     std::fs::write(&source, &bytes).unwrap();
     let map = map::open(&source).unwrap();
     let light = vec![[1.0, 0.0, 0.0]; map.luxels.len()];
-    let error = write(&map.snapshot, &light, &[], &source, &source).unwrap_err();
+    let error = write(&map.snapshot, &light, &[], &[], &source, &source).unwrap_err();
     assert!(matches!(error, Error::SamePath));
     assert_eq!(std::fs::read(&source).unwrap(), bytes);
 }
@@ -41,7 +66,7 @@ fn light_that_does_not_match_the_receivers_is_refused() {
     let dest = dir.join("room_light.bsp");
     std::fs::write(&source, fixture()).unwrap();
     let map = map::open(&source).unwrap();
-    let error = write(&map.snapshot, &[[1.0, 0.0, 0.0]], &[], &source, &dest).unwrap_err();
+    let error = write(&map.snapshot, &[[1.0, 0.0, 0.0]], &[], &[], &source, &dest).unwrap_err();
     assert!(matches!(error, Error::Light));
     assert!(!dest.exists());
     assert_eq!(std::fs::read(&source).unwrap(), fixture());
@@ -82,7 +107,7 @@ fn the_neighbor_replaces_face_light_and_leaves_the_source() {
     light.extend_from_slice(&floor);
     light.extend_from_slice(&wall);
 
-    write(&map.snapshot, &light, &[], &source, &dest).unwrap();
+    write(&map.snapshot, &light, &[], &[], &source, &dest).unwrap();
     assert_eq!(std::fs::read(&source).unwrap(), original);
 
     let written = std::fs::read(&dest).unwrap();
@@ -140,16 +165,39 @@ fn the_neighbor_replaces_face_light_and_leaves_the_source() {
     assert_eq!(opened.snapshot.faces[2].light_offset, -1);
     assert_eq!(opened.snapshot.faces[2].styles, [255, 255, 255, 255]);
 
-    near(sample(&ldr, 0), [0.5, 0.5, 0.25]);
-    for (index, color) in floor.iter().enumerate() {
-        near(sample(&ldr, 4 + index * 4), *color);
+    let floor_soft = super::soften(&floor, 2, 2);
+    let floor_stored: Vec<[f32; 3]> = floor_soft
+        .iter()
+        .copied()
+        .map(|color| super::engine_linear(color, [1.0, 1.0, 1.0]))
+        .collect();
+    near(
+        sample(&ldr, 0),
+        unpack(super::pack_linear(mean(&floor_stored))),
+    );
+    for (index, color) in floor_stored.iter().enumerate() {
+        near(
+            sample(&ldr, 4 + index * 4),
+            unpack(super::pack_linear(*color)),
+        );
     }
+    let wall_soft = super::soften(&wall, 2, 2);
+    let wall_stored: Vec<[f32; 3]> = wall_soft
+        .iter()
+        .copied()
+        .map(|color| super::engine_linear(color, [1.0, 1.0, 1.0]))
+        .collect();
     let wall_at = 24;
-    let wall_mean = mean(&wall);
-    near(sample(&ldr, wall_at - 4), wall_mean);
+    near(
+        sample(&ldr, wall_at - 4),
+        unpack(super::pack_linear(mean(&wall_stored))),
+    );
     for slot in 0..4 {
-        for (index, color) in wall.iter().enumerate() {
-            near(sample(&ldr, wall_at + (slot * 4 + index) * 4), *color);
+        for (index, color) in wall_stored.iter().enumerate() {
+            near(
+                sample(&ldr, wall_at + (slot * 4 + index) * 4),
+                unpack(super::pack_linear(*color)),
+            );
         }
     }
 }
@@ -162,7 +210,7 @@ fn hdr_faces_follow_the_new_lighting() {
     std::fs::write(&source, fixture_with_stale_hdr_faces()).unwrap();
     let map = map::open(&source).unwrap();
     let light = vec![[0.2, 0.3, 0.4]; map.luxels.len()];
-    write(&map.snapshot, &light, &[], &source, &dest).unwrap();
+    write(&map.snapshot, &light, &[], &[], &source, &dest).unwrap();
     let written = std::fs::read(&dest).unwrap();
     let ldr = lump(&written, 7);
     let hdr = lump(&written, 58);
@@ -182,6 +230,31 @@ fn hdr_faces_follow_the_new_lighting() {
 }
 
 #[test]
+fn an_empty_hdr_lump_stays_empty() {
+    let dir = scratch("no-hdr");
+    let source = dir.join("room.bsp");
+    let dest = dir.join("room_light.bsp");
+    let mut original = fixture();
+    let at = 8 + 53 * 16;
+    original[at + 4..at + 8].copy_from_slice(&0i32.to_le_bytes());
+    std::fs::write(&source, &original).unwrap();
+    let map = map::open(&source).unwrap();
+    let light = vec![[0.2, 0.2, 0.2]; map.luxels.len()];
+    write(&map.snapshot, &light, &[], &[], &source, &dest).unwrap();
+    let written = std::fs::read(&dest).unwrap();
+    assert_eq!(
+        i32::from_le_bytes(lump_head(&written, 53)[4..8].try_into().unwrap()),
+        0,
+        "an LDR map must not grow an HDR lighting lump"
+    );
+}
+
+fn lump_head(data: &[u8], index: usize) -> &[u8] {
+    let at = 8 + index * 16;
+    &data[at..at + 16]
+}
+
+#[test]
 fn an_empty_worldlight_lump_receives_the_placed_lamps() {
     let dir = scratch("worldlights");
     let source = dir.join("room.bsp");
@@ -194,7 +267,7 @@ fn an_empty_worldlight_lump_receives_the_placed_lamps() {
         color: [1.0, 0.5, 0.25],
         intensity: 18_000.0,
     }];
-    write(&map.snapshot, &light, &lamps, &source, &dest).unwrap();
+    write(&map.snapshot, &light, &[], &lamps, &source, &dest).unwrap();
     let written = std::fs::read(&dest).unwrap();
     let world = lump(&written, 15);
     assert_eq!(world.len(), 88);
@@ -206,13 +279,60 @@ fn an_empty_worldlight_lump_receives_the_placed_lamps() {
     ];
     assert_eq!(origin, [16.0, 16.0, 64.0]);
     assert_eq!(i32::from_le_bytes(world[40..44].try_into().unwrap()), 1);
+    assert_eq!(f32::from_le_bytes(world[60..64].try_into().unwrap()), 384.0);
     assert_eq!(f32::from_le_bytes(world[72..76].try_into().unwrap()), 1.0);
     let strength = f32::from_le_bytes(world[12..16].try_into().unwrap());
     assert!((strength - 200.0).abs() < 1.0e-3, "{strength}");
     let text = String::from_utf8(lump(&written, 0).to_vec()).unwrap();
-    assert_eq!(text.matches("\"classname\" \"light\"").count(), 2);
-    assert!(text.contains("16.000 16.000 64.000"));
-    assert!(text.contains("255 128 64 200"));
+    let original = String::from_utf8(lump(&fixture(), 0).to_vec()).unwrap();
+    assert_eq!(text, original);
+}
+
+#[test]
+fn static_prop_offsets_move_with_the_game_lump() {
+    let dir = scratch("props-move");
+    let source = dir.join("room.bsp");
+    let dest = dir.join("room_light.bsp");
+    let mut original = fixture();
+    let marker = b"PROPS";
+    let mut game = vec![0u8; 4 + 32 + marker.len()];
+    game[0..4].copy_from_slice(&2i32.to_le_bytes());
+    game[4..8].copy_from_slice(b"prps");
+    game[10..12].copy_from_slice(&10u16.to_le_bytes());
+    let lump_at = original.len() as i32;
+    let payload = lump_at + (4 + 32);
+    game[12..16].copy_from_slice(&payload.to_le_bytes());
+    game[16..20].copy_from_slice(&(marker.len() as i32).to_le_bytes());
+    game[20..24].copy_from_slice(b"prpd");
+    game[36..].copy_from_slice(marker);
+    let at = 8 + 35 * 16;
+    original[at..at + 4].copy_from_slice(&lump_at.to_le_bytes());
+    original[at + 4..at + 8].copy_from_slice(&(game.len() as i32).to_le_bytes());
+    original.extend_from_slice(&game);
+    std::fs::write(&source, &original).unwrap();
+    let map = map::open(&source).unwrap();
+    let light = vec![[0.2, 0.2, 0.2]; map.luxels.len()];
+    let lamps = [PlacedLight {
+        origin: [16.0, 16.0, 64.0],
+        color: [1.0, 1.0, 1.0],
+        intensity: 18_000.0,
+    }];
+    write(&map.snapshot, &light, &[], &lamps, &source, &dest).unwrap();
+    let written = std::fs::read(&dest).unwrap();
+    let new_at = i32::from_le_bytes(lump_head(&written, 35)[0..4].try_into().unwrap());
+    assert_ne!(
+        new_at, lump_at,
+        "the game lump has to move for the test to mean anything"
+    );
+    let game = lump(&written, 35);
+    let moved = i32::from_le_bytes(game[12..16].try_into().unwrap());
+    assert_eq!(moved, new_at + (payload - lump_at));
+    assert_eq!(
+        &written[moved as usize..moved as usize + marker.len()],
+        marker
+    );
+    let untouched = i32::from_le_bytes(game[28..32].try_into().unwrap());
+    assert_eq!(untouched, 0);
 }
 
 fn sample(bytes: &[u8], at: usize) -> [f32; 3] {

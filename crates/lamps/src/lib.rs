@@ -5,7 +5,8 @@ use solve::{Area, Disk, Rectangle};
 
 /// Fluorescent strength. Every other kind is a fraction of this.
 const UNIT_INTENSITY: f32 = 18_000.0;
-const WHITE: Vec3 = Vec3::ONE;
+/// 5000 K. The same warm-neutral as the relapse practicals.
+const WHITE: Vec3 = Vec3::new(1.0, 0.903, 0.816);
 const RED: Vec3 = Vec3::new(1.0, 0.0, 0.0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +45,18 @@ impl Kind {
             Kind::Sconce => 0.375,
             Kind::Camera => 0.125,
             Kind::Emergency => 0.1875,
+        }
+    }
+
+    /// Half-brightness distance, in Source units. A tube lights the bay;
+    /// a camera still dies near the wall.
+    fn reach(self) -> f32 {
+        match self {
+            Kind::Fluorescent => 768.0,
+            Kind::Bulb => 384.0,
+            Kind::Sconce => 320.0,
+            Kind::Camera => 192.0,
+            Kind::Emergency => 256.0,
         }
     }
 }
@@ -86,17 +99,53 @@ impl Lamp {
                     normal: -Vec3::Z,
                     intensity: strength,
                     color: WHITE,
+                    reach: self.kind.reach(),
                 })
             }
-            Kind::Bulb => disk(self.position, 12.0, aim(forward, 37.0), strength, WHITE),
-            Kind::Sconce => disk(self.position, 7.0, aim(forward, 72.0), strength, WHITE),
-            Kind::Camera => disk(self.position, 3.5, aim(forward, 22.0), strength, WHITE),
-            Kind::Emergency => disk(self.position, 5.0, aim(forward, 18.0), strength, RED),
+            Kind::Bulb => disk(
+                self.position,
+                12.0,
+                aim(forward, 37.0),
+                strength,
+                WHITE,
+                self.kind.reach(),
+            ),
+            Kind::Sconce => disk(
+                self.position,
+                7.0,
+                aim(forward, 72.0),
+                strength,
+                WHITE,
+                self.kind.reach(),
+            ),
+            Kind::Camera => disk(
+                self.position,
+                3.5,
+                aim(forward, 22.0),
+                strength,
+                WHITE,
+                self.kind.reach(),
+            ),
+            Kind::Emergency => disk(
+                self.position,
+                5.0,
+                aim(forward, 18.0),
+                strength,
+                RED,
+                self.kind.reach(),
+            ),
         }
     }
 }
 
-fn disk(center: Vec3, radius: f32, normal: Vec3, intensity: f32, color: Vec3) -> Area {
+fn disk(
+    center: Vec3,
+    radius: f32,
+    normal: Vec3,
+    intensity: f32,
+    color: Vec3,
+    reach: f32,
+) -> Area {
     let normal = normal.normalize_or_zero();
     let helper = if normal.z.abs() > 0.9 {
         Vec3::X
@@ -110,6 +159,7 @@ fn disk(center: Vec3, radius: f32, normal: Vec3, intensity: f32, color: Vec3) ->
         axis: helper.cross(normal).normalize_or_zero(),
         intensity,
         color,
+        reach,
     })
 }
 
@@ -209,6 +259,12 @@ mod tests {
         assert!(sconce_tilt > bulb_tilt);
         assert!(bulb_tilt > camera_tilt);
         assert!((emergency_tilt - camera_tilt).abs() > 0.05);
+    }
+
+    #[test]
+    fn a_tube_reaches_farther_than_a_camera() {
+        assert!(placed(Kind::Fluorescent).reach() > placed(Kind::Bulb).reach());
+        assert!(placed(Kind::Bulb).reach() > placed(Kind::Camera).reach());
     }
 
     #[test]

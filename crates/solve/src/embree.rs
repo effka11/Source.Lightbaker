@@ -140,6 +140,8 @@ pub(crate) struct Hit {
     pub normal: Vec3,
     pub distance: f32,
     pub prim: usize,
+    /// The ray met the triangle from behind. `normal` still faces the ray.
+    pub backface: bool,
 }
 
 /// Committed triangle scene. Intersect and occluded queries are safe to call
@@ -272,18 +274,18 @@ impl Scene {
         }
         let prim = ray.prim_id as usize;
         let tri = self.triangles.get(prim)?;
-        let mut normal = (tri.vertices[1] - tri.vertices[0])
+        let geometric = (tri.vertices[1] - tri.vertices[0])
             .cross(tri.vertices[2] - tri.vertices[0])
             .normalize_or_zero();
-        if normal.dot(direction) > 0.0 {
-            normal = -normal;
-        }
+        let backface = geometric.dot(direction) > 0.0;
+        let normal = if backface { -geometric } else { geometric };
         let distance = ray.tfar;
         Some(Hit {
             point: origin + direction * distance,
             normal,
             distance,
             prim,
+            backface,
         })
     }
 }

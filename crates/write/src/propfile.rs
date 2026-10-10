@@ -2,7 +2,7 @@
 //! Model and material bytes are copied compressed, unchanged.
 
 use std::collections::HashSet;
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 
 use map::{PropBody, PropLight};
 use zip::write::SimpleFileOptions;
@@ -59,18 +59,25 @@ fn samples<'a>(light: &'a [[f32; 3]], prop: &PropLight) -> Result<&'a [[f32; 3]]
 }
 
 fn write_zip(pak: &[u8], replacements: &[(String, Vec<u8>)]) -> Result<Vec<u8>, Error> {
-    let skip: HashSet<String> = replacements
-        .iter()
-        .map(|(name, _)| normalize(name))
-        .collect();
     let mut cursor = Cursor::new(Vec::new());
     let mut writer = ZipWriter::new(&mut cursor);
-    if !pak.is_empty() {
+    let kept = if pak.is_empty() {
+        replacements.to_vec()
+    } else {
         let mut archive = ZipArchive::new(Cursor::new(pak)).map_err(|_| Error::NotAMap)?;
-        let names: Vec<String> = archive
-            .file_names()
-            .map(|name| name.to_string())
+        // Source finds the pak by the XZP1 comment. A zip without it does not
+        // mount, and the load hangs.
+        let comment = archive.comment().to_vec();
+        if !comment.is_empty() {
+            writer.set_raw_comment(comment.into_boxed_slice());
+        }
+        let kept: Vec<(String, Vec<u8>)> = replacements
+            .iter()
+            .filter(|(name, bytes)| may_replace(&mut archive, name, bytes))
+            .cloned()
             .collect();
+        let skip: HashSet<String> = kept.iter().map(|(name, _)| normalize(name)).collect();
+        let names: Vec<String> = archive.file_names().map(|name| name.to_string()).collect();
         for (index, name) in names.iter().enumerate() {
             if skip.contains(&normalize(name)) {
                 continue;
@@ -78,9 +85,10 @@ fn write_zip(pak: &[u8], replacements: &[(String, Vec<u8>)]) -> Result<Vec<u8>, 
             let file = archive.by_index_raw(index).map_err(|_| Error::NotAMap)?;
             writer.raw_copy_file(file).map_err(|_| Error::NotAMap)?;
         }
-    }
+        kept
+    };
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-    for (name, bytes) in replacements {
+    for (name, bytes) in &kept {
         writer
             .start_file(name, options)
             .map_err(|_| Error::NotAMap)?;
@@ -88,6 +96,26 @@ fn write_zip(pak: &[u8], replacements: &[(String, Vec<u8>)]) -> Result<Vec<u8>, 
     }
     writer.finish().map_err(|_| Error::NotAMap)?;
     Ok(cursor.into_inner())
+}
+
+/// Replace a lighting file that is already in the pak. The bytes are the mesh
+/// of the model the game loads now. The file on disk can be an older model
+/// with the same name: keeping it makes Garry's Mod drop the prop once the
+/// map is no longer fullbright. A file that was not there is not created.
+/// An invented `sp_hdr_` on an LDR map is what the engine then tries to read.
+fn may_replace(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str, _bytes: &[u8]) -> bool {
+    named(archive, name).is_some()
+}
+
+fn named(archive: &mut ZipArchive<Cursor<&[u8]>>, name: &str) -> Option<Vec<u8>> {
+    let want = normalize(name);
+    let index = archive
+        .file_names()
+        .position(|candidate| normalize(candidate) == want)?;
+    let mut file = archive.by_index(index).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 fn normalize(name: &str) -> String {
@@ -157,7 +185,7 @@ fn ppl(
 
 fn encode_chain(base: &[[f32; 3]], width: u32, height: u32, format: u32) -> Vec<u8> {
     let mut level = if base.len() == (width as usize) * (height as usize) {
-        base.to_vec()
+        super::soften(base, width as usize, height as usize)
     } else {
         vec![[0.0; 3]; (width as usize) * (height as usize)]
     };
@@ -181,15 +209,16 @@ fn encode_chain(base: &[[f32; 3]], width: u32, height: u32, format: u32) -> Vec<
 fn encode_level(colors: &[[f32; 3]], format: u32) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(colors.len() * if format == RGBA16F { 8 } else { 3 });
     for color in colors {
+        let color = super::screen(*color);
         if format == RGBA16F {
-            bytes.extend(f16(finite(color[0])));
-            bytes.extend(f16(finite(color[1])));
-            bytes.extend(f16(finite(color[2])));
+            bytes.extend(f16(color[0]));
+            bytes.extend(f16(color[1]));
+            bytes.extend(f16(color[2]));
             bytes.extend(f16(1.0));
         } else {
-            bytes.push(texture_byte(color[0]));
-            bytes.push(texture_byte(color[1]));
-            bytes.push(texture_byte(color[2]));
+            bytes.push(super::shaded_byte(color[0]));
+            bytes.push(super::shaded_byte(color[1]));
+            bytes.push(super::shaded_byte(color[2]));
         }
     }
     bytes
@@ -219,23 +248,13 @@ fn downsample(src: &[[f32; 3]], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<[f32;
 }
 
 fn vertex_color(color: [f32; 3]) -> [u8; 4] {
+    let color = super::screen(color);
     [
-        texture_byte(color[2]),
-        texture_byte(color[1]),
-        texture_byte(color[0]),
+        super::shaded_byte(color[2]),
+        super::shaded_byte(color[1]),
+        super::shaded_byte(color[0]),
         255,
     ]
-}
-
-fn texture_byte(linear: f32) -> u8 {
-    let linear = finite(linear);
-    if linear <= 0.0 {
-        return 0;
-    }
-    if linear >= 1.0 {
-        return 255;
-    }
-    (linear.powf(1.0 / 2.2) * 255.0).round() as u8
 }
 
 fn f16(value: f32) -> [u8; 2] {
@@ -279,4 +298,98 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 
 fn write_i32(bytes: &mut [u8], offset: usize, value: i32) {
     write_u32(bytes, offset, value as u32);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Read, Write};
+
+    use map::{PropBody, PropLight, PropVerts};
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+    use super::repack;
+
+    fn vhv(checksum: u32, count: u32) -> Vec<u8> {
+        let mut file = vec![0u8; 512];
+        file[0..4].copy_from_slice(&2i32.to_le_bytes());
+        file[4..8].copy_from_slice(&checksum.to_le_bytes());
+        file[8..12].copy_from_slice(&4u32.to_le_bytes());
+        file[12..16].copy_from_slice(&4u32.to_le_bytes());
+        file[16..20].copy_from_slice(&count.to_le_bytes());
+        file[20..24].copy_from_slice(&1u32.to_le_bytes());
+        file[44..48].copy_from_slice(&count.to_le_bytes());
+        file[48..52].copy_from_slice(&512u32.to_le_bytes());
+        file.extend(std::iter::repeat(0).take(count as usize * 4));
+        file
+    }
+
+    fn pak(comment: &[u8], files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut cursor = Cursor::new(Vec::new());
+        let mut zip = ZipWriter::new(&mut cursor);
+        zip.set_raw_comment(comment.to_vec().into_boxed_slice());
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        for (name, bytes) in files {
+            zip.start_file(*name, opts).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        zip.finish().unwrap();
+        cursor.into_inner()
+    }
+
+    fn prop(checksum: u32, count: u32) -> PropLight {
+        PropLight {
+            ldr: "sp_0.vhv".into(),
+            hdr: "sp_hdr_0.vhv".into(),
+            checksum,
+            first: 0,
+            body: PropBody::Vertices {
+                meshes: vec![PropVerts { lod: 0, count }],
+            },
+        }
+    }
+
+    fn names(pak: &[u8]) -> Vec<String> {
+        let mut archive = ZipArchive::new(Cursor::new(pak)).unwrap();
+        let mut out = Vec::new();
+        for index in 0..archive.len() {
+            out.push(archive.by_index(index).unwrap().name().to_string());
+        }
+        out
+    }
+
+    #[test]
+    fn a_stale_prop_file_is_replaced_and_gains_no_hdr_twin() {
+        let comment = b"XZP1 0\0\0\0\0".to_vec();
+        let original = vhv(9, 4);
+        let source = pak(&comment, &[("sp_0.vhv", &original)]);
+        let written = repack(&source, &[prop(1, 1)], &[[1.0, 0.0, 0.0]]).unwrap();
+        assert_eq!(names(&written), vec!["sp_0.vhv".to_string()]);
+        let mut archive = ZipArchive::new(Cursor::new(written.as_slice())).unwrap();
+        assert_eq!(archive.comment(), comment.as_slice());
+        let mut kept = Vec::new();
+        archive
+            .by_name("sp_0.vhv")
+            .unwrap()
+            .read_to_end(&mut kept)
+            .unwrap();
+        assert_ne!(kept, original);
+        assert_eq!(&kept[4..8], &1u32.to_le_bytes());
+    }
+
+    #[test]
+    fn an_existing_hdr_file_is_replaced_and_a_missing_one_is_not_created() {
+        let source = pak(
+            b"XZP1 0",
+            &[("sp_0.vhv", &vhv(1, 1)), ("sp_hdr_0.vhv", &vhv(1, 1))],
+        );
+        let written = repack(&source, &[prop(1, 1)], &[[1.0, 0.0, 0.0]]).unwrap();
+        let got = names(&written);
+        assert!(got.iter().any(|name| name == "sp_0.vhv"));
+        assert!(got.iter().any(|name| name == "sp_hdr_0.vhv"));
+
+        let ldr_only = pak(b"XZP1 0", &[("sp_0.vhv", &vhv(1, 1))]);
+        let written = repack(&ldr_only, &[prop(1, 1)], &[[1.0, 0.0, 0.0]]).unwrap();
+        assert_eq!(names(&written), vec!["sp_0.vhv".to_string()]);
+    }
 }

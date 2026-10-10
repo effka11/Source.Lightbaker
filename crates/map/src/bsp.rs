@@ -888,13 +888,19 @@ fn displace(
                 let slot = (t * width + s) as usize;
                 let placed = decoded.get(slot).and_then(|sample| {
                     sample.and_then(|(tri, bary)| {
-                        sample_point(&surface, &tris[tri], bary, face_normal)
+                        let (position, normal) =
+                            sample_point(&surface, &tris[tri], bary, face_normal)?;
+                        Some((position, normal, blend_at(slice, &tris[tri], bary)))
                     })
                 });
-                let (position, normal) = placed.unwrap_or_else(|| {
+                let (position, normal, blend) = placed.unwrap_or_else(|| {
                     let u = s as f32 / (width - 1).max(1) as f32;
                     let v = t as f32 / (height - 1).max(1) as f32;
-                    (disp::bilinear(corners, u, v), face_normal)
+                    (
+                        disp::bilinear(corners, u, v),
+                        face_normal,
+                        corner_blend(slice, side, u, v),
+                    )
                 });
                 let normal = if normal == Vec3::ZERO {
                     face_normal
@@ -904,7 +910,17 @@ fn displace(
                 let corners = disp::cell(&surface, disp.power, s, t, width, height)
                     .map(|corners| corners.to_vec())
                     .unwrap_or_else(|| luxel_corners(basis, face, s, t, position, normal));
-                push_luxel(&mut luxels, position, normal, albedo, corners);
+                let uv = tex.map(|tex| tex.texel(position)).unwrap_or([0.0, 0.0]);
+                push_luxel(
+                    &mut luxels,
+                    position,
+                    normal,
+                    albedo,
+                    corners,
+                    material_of(tex),
+                    uv,
+                    blend,
+                );
             }
         }
     }
@@ -980,16 +996,20 @@ fn flat_luxels(
                 }
                 None => (center, Vec::new()),
             };
+            let position = basis.at(sample.x, sample.y);
             let corners = piece
                 .iter()
                 .map(|point| basis.at(point.x, point.y))
                 .collect();
             push_luxel(
                 luxels,
-                basis.at(sample.x, sample.y),
+                position,
                 normal,
                 albedo,
                 corners,
+                material_of(Some(tex)),
+                tex.texel(position),
+                0.0,
             );
         }
     }
@@ -1041,25 +1061,66 @@ fn tangent_quad(position: Vec3, normal: Vec3, half: f32) -> Vec<Vec3> {
     ]
 }
 
+fn blend_at(verts: &[DispVert], tri: &[u32; 3], bary: [f32; 3]) -> f32 {
+    let sum = bary[0] + bary[1] + bary[2];
+    if sum < 1.0e-3 {
+        return 0.0;
+    }
+    let mut blend = 0.0;
+    for index in 0..3 {
+        let alpha = verts
+            .get(tri[index] as usize)
+            .map(|vert| vert.alpha)
+            .unwrap_or(0.0);
+        blend += (alpha / 255.0).clamp(0.0, 1.0) * bary[index];
+    }
+    (blend / sum).clamp(0.0, 1.0)
+}
+
+fn corner_blend(verts: &[DispVert], side: usize, u: f32, v: f32) -> f32 {
+    let last = side.saturating_sub(1);
+    let alpha = |x: usize, y: usize| {
+        verts
+            .get(y * side + x)
+            .map(|vert| (vert.alpha / 255.0).clamp(0.0, 1.0))
+            .unwrap_or(0.0)
+    };
+    let a = 1.0 - u;
+    let b = 1.0 - v;
+    (alpha(0, 0) * a * b
+        + alpha(last, 0) * u * b
+        + alpha(last, last) * u * v
+        + alpha(0, last) * a * v)
+        .clamp(0.0, 1.0)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn push_luxel(
     luxels: &mut Vec<Luxel>,
     position: Vec3,
     normal: Vec3,
     albedo: Vec3,
     corners: Vec<Vec3>,
+    material: u32,
+    tex_uv: [f32; 2],
+    blend: f32,
 ) {
     if !position.is_finite() || !normal.is_finite() {
         return;
     }
-    luxels.push(Luxel {
-        receiver: Receiver {
+    let mut luxel = Luxel::plain(
+        Receiver {
             position,
             normal,
             albedo,
             role: role_of(normal),
         },
         corners,
-    });
+    );
+    luxel.material = material;
+    luxel.tex_uv = tex_uv;
+    luxel.blend = blend;
+    luxels.push(luxel);
 }
 
 fn role_of(normal: Vec3) -> Role {

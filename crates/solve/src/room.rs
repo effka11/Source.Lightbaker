@@ -131,7 +131,8 @@ pub fn room() -> Room {
                 half_v: Vec3::new(0.0, 8.0, 0.0),
                 normal: -Vec3::Z,
                 intensity: 18_000.0,
-                color: Vec3::ONE,
+                color: Vec3::new(1.0, 0.903, 0.816),
+                reach: crate::LAMP_REACH,
             }),
             Area::Rectangle(Rectangle {
                 center: Vec3::new(38.0, 42.0, 34.0),
@@ -139,7 +140,8 @@ pub fn room() -> Room {
                 half_v: Vec3::new(0.0, 6.0, 0.0),
                 normal: -Vec3::Z,
                 intensity: 18_000.0,
-                color: Vec3::ONE,
+                color: Vec3::new(1.0, 0.903, 0.816),
+                reach: crate::LAMP_REACH,
             }),
         ],
         grate,
@@ -480,7 +482,7 @@ mod tests {
                 })
                 .expect("open luxel")],
         );
-        assert!(behind_luma > 0.02, "floor behind the wall is {behind_luma}");
+        assert!(behind_luma > 0.01, "floor behind the wall is {behind_luma}");
         assert!(
             behind_luma < open * 0.5,
             "behind {behind_luma}, open {open}"

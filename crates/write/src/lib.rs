@@ -17,11 +17,11 @@ const LUMPS: usize = 64;
 const HEADER: usize = 8 + LUMPS * 16 + 4;
 const FACE: usize = 56;
 const FACES: usize = 7;
-const ENTITIES: usize = 0;
 const LIGHTING: usize = 8;
 /// Compiled lights. An empty lump makes the engine set `mat_fullbright 1`.
 const WORLDLIGHTS: usize = 15;
 const PAKFILE: usize = 40;
+const GAME: usize = 35;
 const LIGHTING_HDR: usize = 53;
 /// `dworldlight_t` as stored by version 0 of the lump.
 const WORLDLIGHT_BYTES: usize = 88;
@@ -79,8 +79,9 @@ enum Patch {
     Lit(i32),
 }
 
-/// One placed lamp. The engine does not read the solve; it reads these as entities
-/// and as the worldlight lump. Without that lump it turns the whole map fullbright.
+/// One placed lamp. The engine does not read the solve. A worldlight at this
+/// point keeps the map from going fullbright and lights a character standing
+/// under the lamp. Without that lump the lightmaps never show.
 #[derive(Clone, Copy, Debug)]
 pub struct PlacedLight {
     pub origin: [f32; 3],
@@ -92,6 +93,7 @@ pub struct PlacedLight {
 pub fn write(
     snapshot: &Snapshot,
     light: &[[f32; 3]],
+    albedo: &[[f32; 3]],
     lights: &[PlacedLight],
     source: &Path,
     destination: &Path,
@@ -99,13 +101,14 @@ pub fn write(
     if same_path(source, destination) {
         return Err(Error::SamePath);
     }
-    let bytes = assemble(snapshot, light, lights)?;
+    let bytes = assemble(snapshot, light, albedo, lights)?;
     commit(destination, &bytes)
 }
 
 fn assemble(
     snapshot: &Snapshot,
     light: &[[f32; 3]],
+    albedo: &[[f32; 3]],
     lights: &[PlacedLight],
 ) -> Result<Vec<u8>, Error> {
     let data = &snapshot.bytes;
@@ -132,7 +135,7 @@ fn assemble(
     if !light_spans(&snapshot.props, face_end, light.len()) {
         return Err(Error::Light);
     }
-    let (lighting, patches) = paint(&snapshot.faces, light)?;
+    let (lighting, patches) = paint(&snapshot.faces, light, albedo)?;
     apply_faces(&mut lumps[FACES].data, &patches);
     // HDR faces keep their own geometry, but their light offsets must land in
     // the lighting we just wrote. Leaving the old offsets reads off the end.
@@ -145,20 +148,23 @@ fn assemble(
     if !snapshot.props.is_empty() {
         lumps[PAKFILE].data = propfile::repack(&lumps[PAKFILE].data, &snapshot.props, light)?;
     }
-    if lumps[LIGHTING_HDR].data.is_empty() {
-        lumps[LIGHTING_HDR].version = lumps[LIGHTING].version;
-        lumps[LIGHTING_HDR].fourcc = lumps[LIGHTING].fourcc;
-    }
+    // A map compiled without HDR has an empty HDR lump. Filling it makes
+    // Garry's Mod read HDR light while the HDR face lump is still absent,
+    // and the load hangs. HDR is written only when the map already had it.
+    let had_hdr = !lumps[LIGHTING_HDR].data.is_empty();
     lumps[LIGHTING].data = lighting.clone();
-    lumps[LIGHTING_HDR].data = lighting;
-    // Relapse ships with an empty worldlight lump and no light entities.
-    // The engine then sets mat_fullbright, so the lightmaps never show.
+    if had_hdr {
+        lumps[LIGHTING_HDR].data = lighting;
+    }
+    // Relapse ships with an empty worldlight lump. The engine then sets
+    // mat_fullbright, and neither the lightmaps nor the prop colors show.
+    // One record per lamp, cut off at a room's width, is enough for characters
+    // standing under it. A light entity is not written: that point would light
+    // the brushes a second time and cast shadow blobs the bake does not have.
     if lumps[WORLDLIGHTS].data.is_empty() && !lights.is_empty() {
         lumps[WORLDLIGHTS].data = worldlight_records(lights);
         lumps[WORLDLIGHTS].version = 0;
         lumps[WORLDLIGHTS].present = true;
-        lumps[ENTITIES].data = append_entities(&lumps[ENTITIES].data, &entity_text(lights));
-        lumps[ENTITIES].present = true;
     }
     Ok(pack(data, &lumps))
 }
@@ -176,14 +182,19 @@ fn worldlight_records(lights: &[PlacedLight]) -> Vec<u8> {
     let mut out = Vec::with_capacity(lights.len() * WORLDLIGHT_BYTES);
     for light in lights {
         let brightness = source_brightness(light.intensity);
-        let color = light.color.map(|channel| channel.clamp(0.0, 1.0) * brightness);
+        let color = light
+            .color
+            .map(|channel| channel.clamp(0.0, 1.0) * brightness);
         push_f32s(&mut out, &light.origin);
         push_f32s(&mut out, &color);
         push_f32s(&mut out, &[0.0, 0.0, 1.0]);
         out.extend((-1i32).to_le_bytes());
         out.extend(EMIT_POINT.to_le_bytes());
         out.extend(0i32.to_le_bytes());
-        for value in [0.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0] {
+        // stopdot, stopdot2, exponent, radius, constant, linear, quadratic.
+        // Radius 0 is an infinite light: its shadow reaches rooms this lamp
+        // does not light. A room's width is as far as the character light goes.
+        for value in [0.0f32, 0.0, 0.0, 384.0, 0.0, 0.0, 1.0] {
             out.extend(value.to_le_bytes());
         }
         out.extend(0i32.to_le_bytes());
@@ -193,44 +204,17 @@ fn worldlight_records(lights: &[PlacedLight]) -> Vec<u8> {
     out
 }
 
-fn entity_text(lights: &[PlacedLight]) -> String {
-    let mut text = String::new();
-    for light in lights {
-        let brightness = source_brightness(light.intensity).round() as i32;
-        let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as i32;
-        text.push_str(&format!(
-            "{{\n\"classname\" \"light\"\n\"origin\" \"{:.3} {:.3} {:.3}\"\n\"_light\" \"{} {} {} {brightness}\"\n}}\n",
-            light.origin[0],
-            light.origin[1],
-            light.origin[2],
-            channel(light.color[0]),
-            channel(light.color[1]),
-            channel(light.color[2]),
-        ));
-    }
-    text
-}
-
-fn append_entities(existing: &[u8], blocks: &str) -> Vec<u8> {
-    let mut out = existing.to_vec();
-    while out.last() == Some(&0) {
-        out.pop();
-    }
-    if !out.is_empty() && *out.last().unwrap() != b'\n' {
-        out.push(b'\n');
-    }
-    out.extend_from_slice(blocks.as_bytes());
-    out.push(0);
-    out
-}
-
 fn push_f32s(out: &mut Vec<u8>, values: &[f32; 3]) {
     for value in values {
         out.extend(finite(*value).to_le_bytes());
     }
 }
 
-fn paint(faces: &[FaceLight], light: &[[f32; 3]]) -> Result<(Vec<u8>, Vec<Patch>), Error> {
+fn paint(
+    faces: &[FaceLight],
+    light: &[[f32; 3]],
+    albedo: &[[f32; 3]],
+) -> Result<(Vec<u8>, Vec<Patch>), Error> {
     for face in faces {
         let start = face.first_luxel as usize;
         let count = face.luxel_count as usize;
@@ -268,20 +252,31 @@ fn paint(faces: &[FaceLight], light: &[[f32; 3]]) -> Result<(Vec<u8>, Vec<Patch>
             return Err(Error::Light);
         }
         let start = face.first_luxel as usize;
-        let color_at = |index: usize| -> [f32; 3] {
-            if count == 0 {
-                [0.0, 0.0, 0.0]
-            } else {
-                light[start + index]
-            }
-        };
+        let raw: Vec<[f32; 3]> = (0..samples)
+            .map(|index| {
+                if count == 0 {
+                    [0.0, 0.0, 0.0]
+                } else {
+                    light[start + index]
+                }
+            })
+            .collect();
+        // The window blurs each face by one luxel before the curve. The game
+        // samples the stored texel on its own, so the same blur has to be in
+        // the file or a dark wall shows the raw speckles.
+        let blurred = soften(&raw, face.width as usize, face.height as usize);
+        let stored: Vec<[f32; 3]> = blurred
+            .iter()
+            .enumerate()
+            .map(|(index, color)| engine_linear(*color, albedo_of(albedo, start + index)))
+            .collect();
         // The average sits in front of lightofs. The engine reads face samples at lightofs.
-        push_sample(&mut bytes, mean(samples, &color_at));
+        push_linear(&mut bytes, mean(stored.len(), &|index| stored[index]));
         let offset = i32::try_from(bytes.len()).map_err(|_| Error::NotAMap)?;
         let slots = if face.bumped { BUMP_SLOTS } else { 1 };
         for _slot in 0..slots {
-            for index in 0..samples {
-                push_sample(&mut bytes, color_at(index));
+            for color in &stored {
+                push_linear(&mut bytes, *color);
             }
         }
         patches.push(Patch::Lit(offset));
@@ -405,9 +400,19 @@ fn pack(data: &[u8], lumps: &[Raw; LUMPS]) -> Vec<u8> {
     for index in order {
         let pad = (4 - body.len() % 4) % 4;
         body.extend(std::iter::repeat(0).take(pad));
-        entries[index].0 = (HEADER + body.len()) as i32;
+        let new_offset = (HEADER + body.len()) as i32;
+        entries[index].0 = new_offset;
         entries[index].1 = lumps[index].data.len() as i32;
-        body.extend_from_slice(&lumps[index].data);
+        if index == GAME && new_offset != lumps[index].offset {
+            let mut bytes = lumps[index].data.clone();
+            // The prop directory stores offsets into the file, not into the
+            // lump. The bytes move with the lump; the old offsets land on
+            // other data, and the engine builds no static props.
+            relocate_game_lump(&mut bytes, lumps[index].offset, new_offset);
+            body.extend_from_slice(&bytes);
+        } else {
+            body.extend_from_slice(&lumps[index].data);
+        }
     }
 
     let mut out = Vec::with_capacity(HEADER + body.len());
@@ -423,9 +428,127 @@ fn pack(data: &[u8], lumps: &[Raw; LUMPS]) -> Vec<u8> {
     out
 }
 
+/// `dgamelump_t.fileofs` is an offset from the start of the BSP. An entry
+/// that pointed into this lump still does, at the lump's new position.
+/// An entry that pointed elsewhere is left alone.
+fn relocate_game_lump(data: &mut [u8], old_offset: i32, new_offset: i32) {
+    let delta = new_offset.wrapping_sub(old_offset);
+    if delta == 0 || data.len() < 4 {
+        return;
+    }
+    let count = i32::from_le_bytes(data[0..4].try_into().unwrap());
+    if count <= 0 || count > 64 {
+        return;
+    }
+    let end = old_offset as i64 + data.len() as i64;
+    for index in 0..count as usize {
+        let at = 4 + index * 16 + 8;
+        if at + 4 > data.len() {
+            return;
+        }
+        let offset = i32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+        let start = offset as i64;
+        if start < old_offset as i64 || start >= end {
+            continue;
+        }
+        let moved = offset.wrapping_add(delta);
+        data[at..at + 4].copy_from_slice(&moved.to_le_bytes());
+    }
+}
+
+/// The window squares `albedo * light` and then bends the shoulder.
+pub fn screen(linear: [f32; 3]) -> [f32; 3] {
+    linear.map(screen_channel)
+}
+
+fn screen_channel(value: f32) -> f32 {
+    let value = finite(value).max(0.0);
+    let curve = value * value;
+    curve / (1.0 + (curve - 0.25).max(0.0))
+}
+
+/// ColorRGBExp32 whose `pow(x, 1/2.2)` is the window shade divided by the
+/// texture byte. The engine multiplies the lightmap by that byte, which
+/// puts the shade back. The LDR table stops at linear 4.
+pub fn engine_linear(irradiance: [f32; 3], albedo: [f32; 3]) -> [f32; 3] {
+    let cap = 4.0_f32.powf(1.0 / 2.2);
+    [0, 1, 2].map(|channel| {
+        let byte = finite(albedo[channel]).max(0.0);
+        if byte <= 1.0e-3 {
+            return 0.0;
+        }
+        let shaded = screen_channel(finite(irradiance[channel]).max(0.0) * byte);
+        let multiplier = (srgb_encode(shaded) / byte).clamp(0.0, cap);
+        if multiplier <= 0.0 {
+            0.0
+        } else {
+            multiplier.powf(2.2).min(4.0)
+        }
+    })
+}
+
+pub fn srgb_encode(linear: f32) -> f32 {
+    let value = finite(linear).clamp(0.0, 1.0);
+    if value <= 0.0031308 {
+        12.92 * value
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Byte a static-prop vertex stores. The engine multiplies it by two, which
+/// restores the sRGB shade instead of the linear one.
+pub fn shaded_byte(shaded: f32) -> u8 {
+    let shaded = finite(shaded).max(0.0);
+    if shaded <= 0.0 {
+        return 0;
+    }
+    let shown = srgb_encode(shaded) * 0.5;
+    if shown >= 1.0 {
+        255
+    } else {
+        (shown * 255.0).round() as u8
+    }
+}
+
+/// One-luxel blur, edges repeated. Matches the window's 3×3 on a padded chart.
+pub fn soften(colors: &[[f32; 3]], width: usize, height: usize) -> Vec<[f32; 3]> {
+    if width == 0 || height == 0 || colors.len() != width.saturating_mul(height) {
+        return colors.to_vec();
+    }
+    let mut out = vec![[0.0; 3]; colors.len()];
+    for t in 0..height {
+        for s in 0..width {
+            let mut sum = [0.0; 3];
+            for dy in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let x = (s as i32 + dx).clamp(0, width as i32 - 1) as usize;
+                    let y = (t as i32 + dy).clamp(0, height as i32 - 1) as usize;
+                    let color = colors[y * width + x];
+                    sum[0] += finite(color[0]);
+                    sum[1] += finite(color[1]);
+                    sum[2] += finite(color[2]);
+                }
+            }
+            out[t * width + s] = sum.map(|channel| channel / 9.0);
+        }
+    }
+    out
+}
+
+fn albedo_of(albedo: &[[f32; 3]], index: usize) -> [f32; 3] {
+    albedo.get(index).copied().unwrap_or([1.0, 1.0, 1.0])
+}
+
+/// ColorRGBExp32 of a white surface. Tests pack a known irradiance this way.
+#[cfg(test)]
+fn pack_sample(linear: [f32; 3]) -> [u8; 4] {
+    pack_linear(engine_linear(linear, [1.0, 1.0, 1.0]))
+}
+
 /// ColorRGBExp32. The engine's linear value is `byte / 255 * 2^exponent`,
 /// so the stored vector is the linear color multiplied by 255.
-fn pack_sample(linear: [f32; 3]) -> [u8; 4] {
+pub(crate) fn pack_linear(linear: [f32; 3]) -> [u8; 4] {
     let scaled = [
         finite(linear[0]).max(0.0) * 255.0,
         finite(linear[1]).max(0.0) * 255.0,
@@ -458,8 +581,8 @@ fn pack_sample(linear: [f32; 3]) -> [u8; 4] {
     ]
 }
 
-fn push_sample(out: &mut Vec<u8>, linear: [f32; 3]) {
-    out.extend_from_slice(&pack_sample(linear));
+fn push_linear(out: &mut Vec<u8>, linear: [f32; 3]) {
+    out.extend_from_slice(&pack_linear(linear));
 }
 
 fn exponent_for(max: f32) -> i32 {

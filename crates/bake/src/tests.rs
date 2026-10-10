@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use glam::Vec3;
 use map::PropBody;
-use solve::{solve, Area, Rectangle, Triangle};
+use solve::{solve, Area, Rectangle, Triangle, LAMP_REACH};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
@@ -27,6 +27,7 @@ fn bake_writes_the_full_budget() {
         ],
     });
     let receivers: Vec<_> = map.luxels.iter().map(|luxel| luxel.receiver).collect();
+    let charts: Vec<[f32; 3]> = map.luxels.iter().map(|luxel| luxel.chart).collect();
     let areas = [Area::Rectangle(Rectangle {
         center: Vec3::new(16.0, 16.0, 48.0),
         half_u: Vec3::new(24.0, 0.0, 0.0),
@@ -34,6 +35,7 @@ fn bake_writes_the_full_budget() {
         normal: -Vec3::Z,
         intensity: 18_000.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     })];
 
     let full = solve(&triangles, &receivers, &areas, FULL_RAYS);
@@ -43,6 +45,7 @@ fn bake_writes_the_full_budget() {
     bake(
         &triangles,
         &receivers,
+        &charts,
         &areas,
         &map.snapshot,
         &source,
@@ -56,26 +59,46 @@ fn bake_writes_the_full_budget() {
     let hdr = span(&written, true);
     assert_eq!(ldr, hdr);
     let mut differed = false;
+    let mut max_delta = 0.0f32;
     for face in &written.snapshot.faces {
         assert_eq!(face.styles, [0, 255, 255, 255]);
         if face.light_offset < 0 {
             continue;
         }
-        for index in 0..face.luxel_count {
-            let at = face.light_offset as usize + index as usize * 4;
+        let start = face.first_luxel as usize;
+        let count = face.luxel_count as usize;
+        let full_soft = write::soften(
+            &full.light[start..start + count],
+            face.width as usize,
+            face.height as usize,
+        );
+        let one_soft = write::soften(
+            &one.light[start..start + count],
+            face.width as usize,
+            face.height as usize,
+        );
+        for index in 0..count {
+            let at = face.light_offset as usize + index * 4;
             let got = unpack(&ldr[at..at + 4]);
-            let slot = face.first_luxel as usize + index as usize;
-            near(got, full.light[slot]);
-            let preview = one.light[slot];
-            if (got[0] - preview[0]).abs() > 0.05
-                || (got[1] - preview[1]).abs() > 0.05
-                || (got[2] - preview[2]).abs() > 0.05
-            {
+            let color = charts[start + index];
+            near(got, write::engine_linear(full_soft[index], color));
+            let preview = write::engine_linear(one_soft[index], color);
+            let delta = (got[0] - preview[0])
+                .abs()
+                .max((got[1] - preview[1]).abs())
+                .max((got[2] - preview[2]).abs());
+            max_delta = max_delta.max(delta);
+            // The file stores the folded color. A stack of lamps that differs
+            // by whole units of linear light is a few hundredths after the fold.
+            if delta > 1.0e-3 {
                 differed = true;
             }
         }
     }
-    assert!(differed, "full budget matched the single-ray light");
+    assert!(
+        differed,
+        "full budget matched the single-ray light, max delta {max_delta}"
+    );
 }
 
 #[test]
@@ -170,6 +193,7 @@ fn grate_blocks_a_stripe_and_prop_light_replaces_only_the_pak() {
         normal: -Vec3::Z,
         intensity: 10_000.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     });
     let solved = solve(&map.triangles, &floor, &[lamp], 32);
     let luma = |color: [f32; 3]| color[0] + color[1] + color[2];
@@ -192,12 +216,13 @@ fn grate_blocks_a_stripe_and_prop_light_replaces_only_the_pak() {
     for sample in &mut light[12..] {
         *sample = [0.0, 1.0, 0.0];
     }
-    write::write(&map.snapshot, &light, &[], &source, &dest).unwrap();
+    write::write(&map.snapshot, &light, &[], &[], &source, &dest).unwrap();
     assert_eq!(std::fs::read(&source).unwrap(), original);
 
     let written = std::fs::read(&dest).unwrap();
     for index in 0..64 {
-        if index == 7 || index == 8 || index == 40 || index == 53 {
+        // 35 is the static-prop directory. Its file offsets move with the lump.
+        if index == 7 || index == 8 || index == 35 || index == 40 || index == 53 {
             continue;
         }
         assert_eq!(
@@ -206,6 +231,12 @@ fn grate_blocks_a_stripe_and_prop_light_replaces_only_the_pak() {
             "lump {index}"
         );
     }
+    let game = lump(&written, 35);
+    assert!(game.windows(9).any(|window| window == b"grate.mdl"));
+    let head = 8 + 35 * 16;
+    let game_at = i32::from_le_bytes(written[head..head + 4].try_into().unwrap());
+    let prop_at = i32::from_le_bytes(game[12..16].try_into().unwrap());
+    assert!(prop_at >= game_at && prop_at < game_at + game.len() as i32);
     let faces = lump(&original, 7).len() / 56;
     for index in 0..faces {
         let old = &lump(&original, 7)[index * 56..(index + 1) * 56];
@@ -216,7 +247,10 @@ fn grate_blocks_a_stripe_and_prop_light_replaces_only_the_pak() {
     }
     let ldr = lump(&written, 8);
     assert_eq!(ldr, lump(&written, 53));
-    assert_eq!(unpack_rgbexp(ldr[..4].try_into().unwrap()), [1.0, 0.0, 0.0]);
+    near(
+        unpack_rgbexp(ldr[..4].try_into().unwrap()),
+        write::engine_linear([1.0, 0.0, 0.0], [1.0, 1.0, 1.0]),
+    );
 
     let old_pak = lump(&original, 40);
     let new_pak = lump(&written, 40);
@@ -246,7 +280,8 @@ fn grate_blocks_a_stripe_and_prop_light_replaces_only_the_pak() {
     assert_eq!(u32_at(&ldr_vhv, 16), 4);
     assert_eq!(u32_at(&ldr_vhv, 20), 1);
     let colors = u32_at(&ldr_vhv, 48) as usize;
-    assert_eq!(&ldr_vhv[colors..colors + 4], &[255, 0, 0, 255]);
+    let shown = gamma_byte(1.0);
+    assert_eq!(&ldr_vhv[colors..colors + 4], &[shown, 0, 0, 255]);
     assert_eq!(ldr_vhv.len() % 512, 0);
 
     let ldr_ppl = zip_bytes(new_pak, "texelslighting_1.ppl");
@@ -257,12 +292,13 @@ fn grate_blocks_a_stripe_and_prop_light_replaces_only_the_pak() {
     assert_eq!(u32_at(&ldr_ppl, 44), 2);
     assert_eq!(u32_at(&ldr_ppl, 48), 2);
     let pixels = u32_at(&ldr_ppl, 36) as usize;
-    assert_eq!(&ldr_ppl[pixels..pixels + 3], &[0, 255, 0]);
+    assert_eq!(&ldr_ppl[pixels..pixels + 3], &[0, shown, 0]);
     let hdr_pixels = u32_at(&hdr_ppl, 36) as usize;
-    assert_eq!(
-        &hdr_ppl[hdr_pixels..hdr_pixels + 8],
-        &[0, 0, 0x00, 0x3C, 0, 0, 0x00, 0x3C]
-    );
+    let hdr_texel = &hdr_ppl[hdr_pixels..hdr_pixels + 8];
+    assert_eq!(&hdr_texel[0..2], &[0, 0]);
+    assert!((half_float(&hdr_texel[2..4]) - write::screen([0.0, 1.0, 0.0])[1]).abs() < 2.0e-3);
+    assert_eq!(&hdr_texel[4..6], &[0, 0]);
+    assert!((half_float(&hdr_texel[6..8]) - 1.0).abs() < 2.0e-3);
     assert_eq!(ldr_ppl.len() % 512, 0);
     assert_eq!(hdr_ppl.len() % 512, 0);
 }
@@ -275,6 +311,20 @@ fn span(map: &map::Map, hdr: bool) -> Vec<u8> {
     };
     let start = span.offset as usize;
     map.snapshot.bytes[start..start + span.length as usize].to_vec()
+}
+
+fn gamma_byte(linear: f32) -> u8 {
+    write::shaded_byte(write::screen([linear, 0.0, 0.0])[0])
+}
+
+fn half_float(bytes: &[u8]) -> f32 {
+    let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
+    let exp = ((bits >> 10) & 0x1f) as i32;
+    let frac = (bits & 0x3ff) as f32 / 1024.0;
+    if exp == 0 {
+        return 0.0;
+    }
+    (1.0 + frac) * 2.0f32.powi(exp - 15)
 }
 
 fn unpack(sample: &[u8]) -> [f32; 3] {

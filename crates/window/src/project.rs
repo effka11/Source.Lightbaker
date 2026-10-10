@@ -32,6 +32,8 @@ pub struct LightObject {
     pub rotation: Vec3,
     pub corners: f32,
     pub intensity: f32,
+    /// Distance, in Source units, where the light is half as bright as on the fixture.
+    pub reach: f32,
     pub color: Vec3,
     /// 0 hides the light on the mesh inside the figure, 100 is the brightest glass.
     pub inside: f32,
@@ -125,36 +127,51 @@ pub struct Fixture {
     pub corners: f32,
     pub intensity: f32,
     pub color: Vec3,
+    /// Half-brightness distance, in Source units.
+    pub reach: f32,
     /// Added to the camera target so the sun and moon start in the sky.
     pub lift: Vec3,
 }
 
-/// Cool fluorescent from the Relapse `lamp_lumi` spots: 210 225 255.
-const LUMI: Vec3 = Vec3::new(0.824, 0.882, 1.0);
-/// Warm bulb from the Relapse `lamp_colba` spots: 255 236 210.
-const COLBA: Vec3 = Vec3::new(1.0, 0.925, 0.824);
+/// 5000 K. One warm-neutral for every practical: an old prison lamp.
+/// Cool tubes and warm bulbs were different kelvins and split the room.
+/// The sun and the moon keep the sky.
+const TONE: Vec3 = Vec3::new(1.0, 0.903, 0.816);
 const FIXTURE: f32 = 18_000.0;
+/// A dome or a security box. Half-brightness at 32 feet.
+const INDOOR_REACH: f32 = 512.0;
+/// A ceiling tube lights the bay. Half-brightness at 48 feet.
+const TUBE_REACH: f32 = 768.0;
+/// A caged bulb lights the cell and the near hall. Half-brightness at 24 feet.
+const BULB_REACH: f32 = 384.0;
+/// A spotlight throws down a corridor. Half-brightness at 80 feet.
+const THROW_REACH: f32 = 1_280.0;
+/// Lamps reach a corridor. The sun's half-brightness is a whole yard.
+pub const REACH_MAX: f32 = 32_768.0;
 
 const RELAPSE_FIXTURES: &[Fixture] = &[
     // Overcast sun from `light_environment` on relapse_jail: 175 230 239.
-    // A disk this strong, 4096 above the floor, lands near a dim cloudy day.
+    // Half-brightness is 12288 units. A short reach died by 4096, the height
+    // this disk starts at, so the yard under it was black.
     Fixture {
         name: "Солнце",
         space: Space::Plane,
         size: Vec3::new(1024.0, 1024.0, 1.0),
         corners: 0.0,
-        intensity: 8_000_000.0,
+        intensity: 1_600_000.0,
         color: Vec3::new(0.686, 0.902, 0.937),
+        reach: 12_288.0,
         lift: Vec3::new(0.0, 0.0, 4096.0),
     },
-    // Dimmer and bluer than the sun, still a disk in the sky.
+    // Dimmer and bluer than the sun. The same reach, or night dies at 4096 too.
     Fixture {
         name: "Луна",
         space: Space::Plane,
         size: Vec3::new(768.0, 768.0, 1.0),
         corners: 0.0,
-        intensity: 1_200_000.0,
+        intensity: 440_000.0,
         color: Vec3::new(0.55, 0.70, 1.0),
+        reach: 12_288.0,
         lift: Vec3::new(1400.0, 0.0, 3200.0),
     },
     // models/props_c17/light_domelight02_on.mdl — 18 × 18.7 × 7.6
@@ -164,7 +181,8 @@ const RELAPSE_FIXTURES: &[Fixture] = &[
         size: Vec3::new(18.0, 18.7, 7.6),
         corners: 0.0,
         intensity: FIXTURE,
-        color: LUMI,
+        color: TONE,
+        reach: INDOOR_REACH,
         lift: Vec3::ZERO,
     },
     // models/props_lab/lab_flourescentlight001a.mdl — 12.4 × 66.4 × 65.9
@@ -174,7 +192,8 @@ const RELAPSE_FIXTURES: &[Fixture] = &[
         size: Vec3::new(12.4, 66.4, 65.9),
         corners: 90.0,
         intensity: FIXTURE,
-        color: LUMI,
+        color: TONE,
+        reach: TUBE_REACH,
         lift: Vec3::ZERO,
     },
     // models/props_wasteland/prison_flourescentlight002b.mdl — 6.2 × 63 × 8.6
@@ -184,7 +203,8 @@ const RELAPSE_FIXTURES: &[Fixture] = &[
         size: Vec3::new(6.2, 63.0, 8.6),
         corners: 55.0,
         intensity: FIXTURE,
-        color: LUMI,
+        color: TONE,
+        reach: TUBE_REACH,
         lift: Vec3::ZERO,
     },
     // models/props_wasteland/prison_cagedlight001a.mdl — 4.1 × 7.8 × 13.1
@@ -194,7 +214,8 @@ const RELAPSE_FIXTURES: &[Fixture] = &[
         size: Vec3::new(4.1, 7.8, 13.1),
         corners: 25.0,
         intensity: FIXTURE,
-        color: COLBA,
+        color: TONE,
+        reach: BULB_REACH,
         lift: Vec3::ZERO,
     },
     // models/props_wasteland/prison_lamp001a.mdl — 22.1 × 22.1 × 25.7
@@ -204,7 +225,8 @@ const RELAPSE_FIXTURES: &[Fixture] = &[
         size: Vec3::new(22.1, 22.1, 25.7),
         corners: 20.0,
         intensity: FIXTURE,
-        color: COLBA,
+        color: TONE,
+        reach: BULB_REACH,
         lift: Vec3::ZERO,
     },
     // models/props/de_nuke/wall_light.mdl — 5.9 × 38.7 × 3.4
@@ -214,7 +236,8 @@ const RELAPSE_FIXTURES: &[Fixture] = &[
         size: Vec3::new(5.9, 38.7, 3.4),
         corners: 70.0,
         intensity: FIXTURE,
-        color: COLBA,
+        color: TONE,
+        reach: BULB_REACH,
         lift: Vec3::ZERO,
     },
     // models/props/cs_office/light_security.mdl — 9.6 × 19.5 × 15.9
@@ -224,7 +247,8 @@ const RELAPSE_FIXTURES: &[Fixture] = &[
         size: Vec3::new(9.6, 19.5, 15.9),
         corners: 40.0,
         intensity: 20_000.0,
-        color: Vec3::new(0.90, 0.95, 1.0),
+        color: TONE,
+        reach: INDOOR_REACH,
         lift: Vec3::ZERO,
     },
     // models/props_wasteland/light_spotlight01_lamp.mdl — 22.2 × 19.9 × 19.3
@@ -234,7 +258,8 @@ const RELAPSE_FIXTURES: &[Fixture] = &[
         size: Vec3::new(22.2, 19.9, 19.3),
         corners: 30.0,
         intensity: 28_000.0,
-        color: Vec3::new(0.96, 0.98, 1.0),
+        color: TONE,
+        reach: THROW_REACH,
         lift: Vec3::ZERO,
     },
 ];
@@ -285,6 +310,7 @@ impl LightObject {
             rotation: Vec3::new(0.0, template_pitch(kind), 0.0),
             corners,
             intensity: area.intensity(),
+            reach: area.reach(),
             color: area.color(),
             inside: base_inside(),
             rim: base_rim(),
@@ -293,7 +319,7 @@ impl LightObject {
             template: Some(kind),
             custom: false,
         };
-        apply_base(&mut object, &crate::base::live());
+        write_base_glass(&mut object, &crate::base::live());
         object
     }
 
@@ -307,6 +333,7 @@ impl LightObject {
             rotation: Vec3::ZERO,
             corners: fixture.corners,
             intensity: fixture.intensity,
+            reach: fixture.reach,
             color: fixture.color,
             inside: base_inside(),
             rim: base_rim(),
@@ -315,7 +342,7 @@ impl LightObject {
             template: None,
             custom: true,
         };
-        apply_base(&mut object, &crate::base::live());
+        write_base_glass(&mut object, &crate::base::live());
         object
     }
 
@@ -341,7 +368,8 @@ impl LightObject {
             rotation: Vec3::ZERO,
             corners: if round { 0.0 } else { 100.0 },
             intensity: lamp.intensity(),
-            color: Vec3::ONE,
+            reach: INDOOR_REACH,
+            color: TONE,
             inside: base_inside(),
             rim: base_rim(),
             spread: base_spread(),
@@ -497,6 +525,7 @@ impl LightObject {
                 y * self.size.y.max(1.0) * 0.5,
                 blend,
                 self.intensity,
+                self.reach,
                 self.color,
             );
         } else {
@@ -514,6 +543,7 @@ impl LightObject {
                 axis_z: z * hz,
                 intensity: share * cavity,
                 color: self.color,
+                reach: self.reach,
             }));
             areas.push(Area::Omni(Omni {
                 center: self.position,
@@ -522,6 +552,7 @@ impl LightObject {
                 axis_z: z * hz,
                 intensity: self.intensity / 3.0,
                 color: self.color,
+                reach: self.reach,
             }));
         }
         areas
@@ -536,6 +567,7 @@ fn push_patch(
     half_v: Vec3,
     blend: f32,
     intensity: f32,
+    reach: f32,
     color: Vec3,
 ) {
     let normal = normal.normalize_or_zero();
@@ -550,6 +582,7 @@ fn push_patch(
             normal,
             intensity: intensity * blend,
             color,
+            reach,
         }));
     }
     if blend < 0.999 {
@@ -560,13 +593,14 @@ fn push_patch(
                 radius,
                 normal,
                 intensity * (1.0 - blend),
+                reach,
                 color,
             ));
         }
     }
 }
 
-fn disk(center: Vec3, radius: f32, normal: Vec3, intensity: f32, color: Vec3) -> Area {
+fn disk(center: Vec3, radius: f32, normal: Vec3, intensity: f32, reach: f32, color: Vec3) -> Area {
     let helper = if normal.z.abs() > 0.9 {
         Vec3::X
     } else {
@@ -579,6 +613,7 @@ fn disk(center: Vec3, radius: f32, normal: Vec3, intensity: f32, color: Vec3) ->
         axis: helper.cross(normal).normalize_or_zero(),
         intensity,
         color,
+        reach,
     })
 }
 
@@ -656,6 +691,8 @@ struct SavedObject {
     rotation: [f32; 3],
     corners: f32,
     intensity: f32,
+    #[serde(default = "default_reach")]
+    reach: f32,
     color: [f32; 3],
     #[serde(default = "default_inside")]
     inside: f32,
@@ -669,6 +706,12 @@ struct SavedObject {
     template: Option<String>,
     #[serde(default)]
     custom: bool,
+}
+
+fn default_reach() -> f32 {
+    // An old file has no reach. 48 is the previous falloff, so a saved sun
+    // stays a sun and a saved lamp stays as it was until the slider moves.
+    solve::LAMP_REACH
 }
 
 fn default_inside() -> f32 {
@@ -687,12 +730,11 @@ fn default_mesh() -> f32 {
     base_mesh()
 }
 
-/// Copy the saved base onto a light. Name, category, and position stay.
+/// Copy a saved preset onto a plain shape. Glass always. Strength, reach, color,
+/// and the hull only when that preset was saved in full. A named fixture does not
+/// use this: its strength lives on the fixture itself.
 pub fn apply_base(object: &mut LightObject, base: &crate::base::Params) {
-    object.inside = base.inside.clamp(0.0, 100.0);
-    object.rim = base.rim.clamp(0.0, 100.0);
-    object.spread = base.spread.clamp(0.0, 100.0);
-    object.mesh = base.mesh.clamp(0.0, 100.0);
+    write_base_glass(object, base);
     if !base.complete {
         return;
     }
@@ -704,9 +746,84 @@ pub fn apply_base(object: &mut LightObject, base: &crate::base::Params) {
     object.size = Vec3::from_array(base.size).max(Vec3::splat(1.0));
     object.rotation = Vec3::from_array(base.rotation);
     object.corners = base.corners.clamp(0.0, 100.0);
-    object.intensity = base.intensity.max(0.0);
-    object.color = Vec3::from_array(base.color).clamp(Vec3::ZERO, Vec3::ONE);
+    write_base_light(object, base);
     object.custom = true;
+}
+
+/// The panel button. Glass comes from the base. Strength, reach, and color come
+/// back from that light's fixture or lamp kind. A plain shape with no kind takes
+/// the saved preset, and its hull only when that preset was saved in full.
+pub fn bring_to_base(object: &mut LightObject, base: &crate::base::Params) {
+    write_base_glass(object, base);
+    if let Some((intensity, reach, color)) = coded_emitter(&object.name, object.template) {
+        object.intensity = intensity.max(0.0);
+        object.reach = reach.clamp(32.0, REACH_MAX);
+        object.color = color.clamp(Vec3::ZERO, Vec3::ONE);
+        return;
+    }
+    write_base_light(object, base);
+    object.custom = true;
+    if !base.complete {
+        return;
+    }
+    object.space = if base.solid {
+        Space::Solid
+    } else {
+        Space::Plane
+    };
+    object.size = Vec3::from_array(base.size).max(Vec3::splat(1.0));
+    object.rotation = Vec3::from_array(base.rotation);
+    object.corners = base.corners.clamp(0.0, 100.0);
+}
+
+/// Strength written next to a fixture or a lamp kind. `None` for a plain shape.
+fn coded_emitter(name: &str, template: Option<Kind>) -> Option<(f32, f32, Vec3)> {
+    if let Some(fixture) = relapse_fixtures()
+        .iter()
+        .find(|fixture| fixture.name == name)
+    {
+        return Some((fixture.intensity, fixture.reach, fixture.color));
+    }
+    let kind = template?;
+    let area = Lamp {
+        kind,
+        position: Vec3::ZERO,
+        forward: Vec3::X,
+    }
+    .area();
+    Some((area.intensity(), area.reach(), area.color()))
+}
+
+/// A project saved after every lamp was forced to the generic preset gets its
+/// own strength back. A reach the user actually chose is left alone.
+fn adopt_coded_emitter(object: &mut LightObject) {
+    let Some((intensity, reach, color)) = coded_emitter(&object.name, object.template) else {
+        return;
+    };
+    let base = crate::base::live();
+    let flattened =
+        (object.intensity - base.intensity).abs() < 1.0 && (object.reach - base.reach).abs() < 0.5;
+    let differs = (intensity - object.intensity).abs() > 1.0
+        || (reach - object.reach).abs() > 0.5
+        || (color - object.color).length() > 1.0e-3;
+    if flattened && differs {
+        object.intensity = intensity.max(0.0);
+        object.reach = reach.clamp(32.0, REACH_MAX);
+        object.color = color.clamp(Vec3::ZERO, Vec3::ONE);
+    }
+}
+
+fn write_base_glass(object: &mut LightObject, base: &crate::base::Params) {
+    object.inside = base.inside.clamp(0.0, 100.0);
+    object.rim = base.rim.clamp(0.0, 100.0);
+    object.spread = base.spread.clamp(0.0, 100.0);
+    object.mesh = base.mesh.clamp(0.0, 100.0);
+}
+
+fn write_base_light(object: &mut LightObject, base: &crate::base::Params) {
+    object.intensity = base.intensity.max(0.0);
+    object.reach = base.reach.clamp(32.0, REACH_MAX);
+    object.color = Vec3::from_array(base.color).clamp(Vec3::ZERO, Vec3::ONE);
 }
 
 pub fn capture_base(object: &LightObject) -> crate::base::Params {
@@ -717,6 +834,7 @@ pub fn capture_base(object: &LightObject) -> crate::base::Params {
         rotation: object.rotation.to_array(),
         corners: object.corners,
         intensity: object.intensity,
+        reach: object.reach,
         color: object.color.to_array(),
         inside: object.inside,
         rim: object.rim,
@@ -832,6 +950,7 @@ impl From<&LightObject> for SavedObject {
             rotation: object.rotation.to_array(),
             corners: object.corners,
             intensity: object.intensity,
+            reach: object.reach.clamp(32.0, REACH_MAX),
             color: object.color.to_array(),
             inside: object.inside.clamp(0.0, 100.0),
             rim: object.rim.clamp(0.0, 100.0),
@@ -845,7 +964,7 @@ impl From<&LightObject> for SavedObject {
 
 impl SavedObject {
     fn into_object(self) -> LightObject {
-        LightObject {
+        let mut object = LightObject {
             name: self.name,
             category: self.category,
             space: if self.space == "3d" {
@@ -858,6 +977,7 @@ impl SavedObject {
             rotation: Vec3::from_array(self.rotation),
             corners: self.corners.clamp(0.0, 100.0),
             intensity: self.intensity.max(0.0),
+            reach: self.reach.clamp(32.0, REACH_MAX),
             color: Vec3::from_array(self.color),
             inside: self.inside.clamp(0.0, 100.0),
             rim: self.rim.clamp(0.0, 100.0),
@@ -865,7 +985,9 @@ impl SavedObject {
             mesh: self.mesh.clamp(0.0, 100.0),
             template: self.template.as_deref().and_then(kind_from),
             custom: self.custom,
-        }
+        };
+        adopt_coded_emitter(&mut object);
+        object
     }
 }
 
@@ -926,8 +1048,9 @@ mod tests {
         assert!(close(got.half_u, lamp.half_u));
         assert!(close(got.half_v, lamp.half_v));
         assert!(close(got.normal, lamp.normal));
-        assert_eq!(got.intensity, lamp.intensity);
-        assert_eq!(got.color, lamp.color);
+        assert!((got.intensity - lamp.intensity).abs() < 1.0e-2);
+        assert!(close(got.color, lamp.color));
+        assert!((got.reach - lamp.reach).abs() < 1.0e-2);
     }
 
     #[test]
@@ -956,6 +1079,7 @@ mod tests {
         assert!(close(got.half_v, lamp.half_v));
         assert!(close(got.normal, lamp.normal));
         assert!((got.intensity - lamp.intensity).abs() < 1.0e-2);
+        assert!((got.reach - lamp.reach).abs() < 1.0e-2);
     }
 
     #[test]
@@ -984,6 +1108,7 @@ mod tests {
         assert!(close(got.normal, lamp.normal));
         assert!((got.intensity - lamp.intensity).abs() < 1.0e-2);
         assert!(close(got.color, lamp.color));
+        assert!((got.reach - lamp.reach).abs() < 1.0e-2);
     }
 
     #[test]
@@ -1061,6 +1186,7 @@ mod tests {
         object.size = Vec3::new(7.0, 8.0, 9.0);
         object.corners = 25.0;
         object.intensity = 18_000.0;
+        object.reach = 240.0;
         object.color = Vec3::new(1.0, 0.5, 0.25);
         object.inside = 40.0;
         object.rim = 70.0;
@@ -1086,6 +1212,7 @@ mod tests {
         assert!(close(got.size, object.size));
         assert!((got.corners - object.corners).abs() < 1.0e-3);
         assert!((got.intensity - object.intensity).abs() < 1.0e-3);
+        assert!((got.reach - object.reach).abs() < 1.0e-3);
         assert!(close(got.color, object.color));
         assert!((got.inside - object.inside).abs() < 1.0e-3);
         assert!((got.rim - object.rim).abs() < 1.0e-3);
@@ -1109,25 +1236,26 @@ mod tests {
         }
         let sun = LightObject::from_fixture(&fixtures[0], at);
         let moon = LightObject::from_fixture(&fixtures[1], at);
-        let base = crate::base::live();
-        if base.complete {
-            assert!((sun.intensity - base.intensity).abs() < 1.0);
-            assert!((moon.intensity - base.intensity).abs() < 1.0);
-            assert_eq!(
-                sun.space,
-                if base.solid {
-                    Space::Solid
-                } else {
-                    Space::Plane
-                }
-            );
-        } else {
-            assert!(sun.intensity > moon.intensity * 4.0);
-            assert!(sun.color.z > sun.color.x);
-            assert!(moon.color.z > moon.color.x);
-            assert!(moon.color.z > sun.color.z);
-            assert_eq!(sun.space, Space::Plane);
-        }
+        assert!((sun.intensity - fixtures[0].intensity).abs() < 1.0);
+        assert!((moon.intensity - fixtures[1].intensity).abs() < 1.0);
+        assert!(sun.color.z > sun.color.x);
+        assert!(moon.color.z > moon.color.x);
+        assert!(moon.color.z > sun.color.z);
+        assert_eq!(sun.space, Space::Plane);
+        let cage_fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "Клетка")
+            .unwrap();
+        let cage = LightObject::from_fixture(cage_fixture, Vec3::ZERO);
+        assert!((cage.intensity - cage_fixture.intensity).abs() < 1.0);
+        assert!((cage.reach - cage_fixture.reach).abs() < 1.0);
+        let spot_fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "Прожектор")
+            .unwrap();
+        let spot = LightObject::from_fixture(spot_fixture, Vec3::ZERO);
+        assert!((spot.intensity - spot_fixture.intensity).abs() < 1.0);
+        assert!((spot.reach - spot_fixture.reach).abs() < 1.0);
         let dome = LightObject::from_fixture(
             fixtures
                 .iter()
@@ -1136,16 +1264,14 @@ mod tests {
             Vec3::ZERO,
         );
         let areas = dome.areas();
-        if !base.complete || base.solid {
-            assert!(areas.iter().any(|area| matches!(area, Area::Volume(_))));
-            assert!(areas.iter().any(|area| matches!(area, Area::Omni(_))));
-            assert!(
-                !areas
-                    .iter()
-                    .any(|area| matches!(area, Area::Rectangle(_) | Area::Disk(_))),
-                "the hull faces would cut the room"
-            );
-        }
+        assert!(areas.iter().any(|area| matches!(area, Area::Volume(_))));
+        assert!(areas.iter().any(|area| matches!(area, Area::Omni(_))));
+        assert!(
+            !areas
+                .iter()
+                .any(|area| matches!(area, Area::Rectangle(_) | Area::Disk(_))),
+            "the hull faces would cut the room"
+        );
         let tube = fixtures
             .iter()
             .find(|fixture| fixture.name == "Люминесцент")
@@ -1163,11 +1289,7 @@ mod tests {
         let cage = LightObject::from_fixture(fixture, Vec3::ZERO);
         let glow = cage.figure_glow().expect("lamp");
         let base = crate::base::live();
-        let expect_color = if base.complete {
-            Vec3::from_array(base.color)
-        } else {
-            fixture.color
-        };
+        let expect_color = Vec3::from_array(base.color);
         assert!(glow.contains(cage.position));
         assert!(glow.contains(cage.position + Vec3::X * (cage.size.x * 0.5)));
         assert!(!glow.contains(cage.position + Vec3::Z * (cage.size.z + 80.0)));
@@ -1214,6 +1336,7 @@ mod tests {
                 rotation: [1.0, 2.0, 3.0],
                 corners: 15.0,
                 intensity: 500.0,
+                reach: 200.0,
                 color: [0.2, 0.3, 0.4],
                 inside: 10.0,
                 rim: 20.0,
@@ -1230,9 +1353,113 @@ mod tests {
         assert!((object.rotation.y - 2.0).abs() < 1.0e-3);
         assert!((object.corners - 15.0).abs() < 1.0e-3);
         assert!((object.intensity - 500.0).abs() < 1.0e-3);
+        assert!((object.reach - 200.0).abs() < 1.0e-3);
         assert!(close(object.color, Vec3::new(0.2, 0.3, 0.4)));
         assert!((object.inside - 10.0).abs() < 1.0e-3);
         assert!((object.mesh - 40.0).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn the_button_restores_each_fixtures_own_strength() {
+        let base = crate::base::live();
+        let fixture = relapse_fixtures()
+            .iter()
+            .find(|fixture| fixture.name == "Прожектор")
+            .unwrap();
+        let mut object = LightObject::from_fixture(fixture, Vec3::new(1.0, 2.0, 3.0));
+        object.intensity = base.intensity;
+        object.reach = base.reach;
+        object.color = Vec3::from_array(base.color);
+        object.inside = 0.0;
+        let size = object.size;
+        bring_to_base(&mut object, &base);
+        assert!((object.intensity - fixture.intensity).abs() < 1.0e-2);
+        assert!((object.reach - fixture.reach).abs() < 1.0e-2);
+        assert!(close(object.color, fixture.color));
+        assert!((object.inside - base.inside).abs() < 1.0e-3);
+        assert!(close(object.size, size));
+        assert!(object
+            .areas()
+            .iter()
+            .all(|area| (area.reach() - fixture.reach).abs() < 1.0e-2));
+    }
+
+    #[test]
+    fn bringing_to_base_uses_the_saved_light_and_keeps_the_shape() {
+        let mut object = LightObject::from_base(Base::Square, Vec3::new(1.0, 2.0, 3.0));
+        let place = object.position;
+        let size = object.size;
+        let space = object.space;
+        let corners = object.corners;
+        bring_to_base(
+            &mut object,
+            &crate::base::Params {
+                complete: false,
+                solid: true,
+                size: [4.0, 5.0, 6.0],
+                rotation: [9.0, 8.0, 7.0],
+                corners: 12.0,
+                intensity: 500.0,
+                reach: 160.0,
+                color: [1.0, 0.9, 0.8],
+                inside: 80.0,
+                rim: 10.0,
+                spread: 20.0,
+                mesh: 30.0,
+            },
+        );
+        assert_eq!(object.position, place);
+        assert!(close(object.size, size));
+        assert_eq!(object.space, space);
+        assert!((object.corners - corners).abs() < 1.0e-3);
+        assert!(object.custom);
+        assert!((object.intensity - 500.0).abs() < 1.0e-3);
+        assert!((object.reach - 160.0).abs() < 1.0e-3);
+        assert!(close(object.color, Vec3::new(1.0, 0.9, 0.8)));
+        assert!((object.inside - 80.0).abs() < 1.0e-3);
+        assert!((object.rim - 10.0).abs() < 1.0e-3);
+        let areas = object.areas();
+        assert!(!areas.is_empty());
+        assert!(areas
+            .iter()
+            .all(|area| (area.reach() - 160.0).abs() < 1.0e-3));
+        assert!(areas
+            .iter()
+            .all(|area| close(area.color(), Vec3::new(1.0, 0.9, 0.8))));
+        if object.space == Space::Plane {
+            let strength: f32 = areas.iter().map(|area| area.intensity()).sum();
+            assert!((strength - 500.0).abs() < 1.0);
+        }
+    }
+
+    #[test]
+    fn a_flattened_spotlight_loads_its_own_throw() {
+        let saved: SavedProject = serde_json::from_str(
+            r#"{
+                "map": "x",
+                "categories": [],
+                "objects": [{
+                    "name": "Прожектор",
+                    "category": "relapse",
+                    "space": "3d",
+                    "size": [22.2, 19.9, 19.3],
+                    "position": [0.0, 0.0, 0.0],
+                    "rotation": [0.0, 0.0, 0.0],
+                    "corners": 30.0,
+                    "intensity": 18000.0,
+                    "reach": 160.0,
+                    "color": [1.0, 0.903, 0.816]
+                }]
+            }"#,
+        )
+        .expect("flattened spotlight");
+        let object = saved.objects.into_iter().next().unwrap().into_object();
+        let fixture = relapse_fixtures()
+            .iter()
+            .find(|fixture| fixture.name == "Прожектор")
+            .unwrap();
+        assert!((object.intensity - fixture.intensity).abs() < 1.0);
+        assert!((object.reach - fixture.reach).abs() < 1.0);
     }
 
     #[test]
@@ -1261,5 +1488,69 @@ mod tests {
         assert_eq!(object.rim, base.rim);
         assert_eq!(object.spread, base.spread);
         assert_eq!(object.mesh, base.mesh);
+        assert!((object.reach - solve::LAMP_REACH).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn practicals_share_one_tone_and_a_throw_reaches_farther() {
+        let fixtures = relapse_fixtures();
+        let tone = fixtures
+            .iter()
+            .find(|fixture| fixture.name == "Люминесцент")
+            .unwrap()
+            .color;
+        for fixture in fixtures {
+            if fixture.name == "Солнце" || fixture.name == "Луна" {
+                assert!(fixture.color.z > fixture.color.x, "{}", fixture.name);
+                continue;
+            }
+            assert!(close(fixture.color, tone), "{}", fixture.name);
+            assert!(fixture.color.x > fixture.color.z, "{}", fixture.name);
+        }
+        let reach = |name: &str| {
+            fixtures
+                .iter()
+                .find(|fixture| fixture.name == name)
+                .unwrap()
+                .reach
+        };
+        assert!(reach("Прожектор") > reach("Люминесцент"));
+        assert!(reach("Люминесцент") > reach("Клетка"));
+    }
+
+    #[test]
+    fn the_sun_still_lights_four_thousand_units_away() {
+        let fixtures = relapse_fixtures();
+        let sun = LightObject::from_fixture(
+            fixtures
+                .iter()
+                .find(|fixture| fixture.name == "Солнце")
+                .unwrap(),
+            Vec3::ZERO,
+        );
+        let moon = LightObject::from_fixture(
+            fixtures
+                .iter()
+                .find(|fixture| fixture.name == "Луна")
+                .unwrap(),
+            Vec3::ZERO,
+        );
+        assert!(sun.reach > 4_000.0);
+        assert!(sun.reach <= REACH_MAX);
+        let ground = |at: Vec3| solve::Receiver {
+            position: at,
+            normal: Vec3::Z,
+            albedo: Vec3::ONE,
+            role: solve::Role::Floor,
+        };
+        let day = solve::dynamic(
+            &[ground(Vec3::ZERO), ground(Vec3::new(4_000.0, 0.0, 0.0))],
+            &sun.areas(),
+        );
+        assert!(day[0][1] > 4.0, "under the sun {}", day[0][1]);
+        assert!(day[1][1] > 3.0, "four thousand aside {}", day[1][1]);
+        let night = solve::dynamic(&[ground(Vec3::ZERO)], &moon.areas());
+        assert!(night[0][1] > 1.0, "under the moon {}", night[0][1]);
+        assert!(night[0][1] < day[0][1] * 0.5);
     }
 }

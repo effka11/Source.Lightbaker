@@ -100,6 +100,26 @@ pub struct Luxel {
     /// belongs to. Empty when the luxel's cell lies off the face: its light is
     /// still written, but there is nothing to draw.
     pub corners: Vec<Vec3>,
+    /// Texture color the window shades at this luxel, as UNORM bytes. The
+    /// lightmap divides by it so the game's texture multiply restores that
+    /// shade. Albedo when the face has no texture.
+    pub chart: [f32; 3],
+    material: u32,
+    tex_uv: [f32; 2],
+    blend: f32,
+}
+
+impl Luxel {
+    pub(crate) fn plain(receiver: Receiver, corners: Vec<Vec3>) -> Self {
+        Self {
+            chart: [receiver.albedo.x, receiver.albedo.y, receiver.albedo.z],
+            material: NO_MATERIAL,
+            tex_uv: [0.0, 0.0],
+            blend: 0.0,
+            receiver,
+            corners,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -276,6 +296,7 @@ pub fn open_reporting(
     let mut luxels = luxels;
     triangles.extend(placed.triangles);
     luxels.extend(placed.luxels);
+    paint_charts(&mut luxels, &materials, &images);
     let mut doors = doors;
     doors.extend(placed.doors);
     for (index, door) in doors.iter_mut().enumerate() {
@@ -299,6 +320,96 @@ pub fn open_reporting(
             props: placed.props,
         },
     })
+}
+
+/// The window shades `mix(base, second, blend)`, then mixes in `base * detail * 2`.
+/// Those bytes are what the game multiplies the lightmap by.
+fn paint_charts(luxels: &mut [Luxel], materials: &[Material], images: &[Image]) {
+    for luxel in luxels {
+        let Some(material) = materials.get(luxel.material as usize) else {
+            continue;
+        };
+        let Some(base) = texture(material.texture, images) else {
+            continue;
+        };
+        let size = [base.width.max(1) as f32, base.height.max(1) as f32];
+        let uv = [luxel.tex_uv[0] / size[0], luxel.tex_uv[1] / size[1]];
+        if !uv[0].is_finite() || !uv[1].is_finite() {
+            continue;
+        }
+        let Some(primary) = sample_unit(base, uv) else {
+            continue;
+        };
+        let mut color = primary;
+        if let Some(second) = texture(material.texture2, images) {
+            if let Some(secondary) = sample_unit(second, uv) {
+                color = mix(primary, secondary, luxel.blend.clamp(0.0, 1.0));
+            }
+        }
+        if let Some(detail) = texture(material.detail, images) {
+            let scaled = [uv[0] * material.detail_scale, uv[1] * material.detail_scale];
+            if let Some(grain) = sample_unit(detail, scaled) {
+                let modulated = [
+                    color[0] * grain[0] * 2.0,
+                    color[1] * grain[1] * 2.0,
+                    color[2] * grain[2] * 2.0,
+                ];
+                color = mix(color, modulated, material.detail_factor.clamp(0.0, 1.0));
+            }
+        }
+        luxel.chart = color;
+    }
+}
+
+fn texture(index: Option<u32>, images: &[Image]) -> Option<&Image> {
+    images.get(index? as usize)
+}
+
+fn mix(from: [f32; 3], to: [f32; 3], t: f32) -> [f32; 3] {
+    [
+        from[0] + (to[0] - from[0]) * t,
+        from[1] + (to[1] - from[1]) * t,
+        from[2] + (to[2] - from[2]) * t,
+    ]
+}
+
+/// Bilinear sample in the window's repeat space. `uv` is 0..1 across the image.
+fn sample_unit(image: &Image, uv: [f32; 2]) -> Option<[f32; 3]> {
+    let pixels = image.mips.first()?;
+    let w = image.width.max(1);
+    let h = image.height.max(1);
+    let need = (w as usize).saturating_mul(h as usize).saturating_mul(4);
+    if pixels.len() < need {
+        return None;
+    }
+    let x = wrap_pixel(uv[0], w);
+    let y = wrap_pixel(uv[1], h);
+    let x0 = (x.floor() as u32) % w;
+    let y0 = (y.floor() as u32) % h;
+    let x1 = (x0 + 1) % w;
+    let y1 = (y0 + 1) % h;
+    let fx = x - x.floor();
+    let fy = y - y.floor();
+    let at = |px: u32, py: u32| {
+        let index = ((py * w + px) * 4) as usize;
+        [
+            pixels[index] as f32 / 255.0,
+            pixels[index + 1] as f32 / 255.0,
+            pixels[index + 2] as f32 / 255.0,
+        ]
+    };
+    let top = mix(at(x0, y0), at(x1, y0), fx);
+    Some(mix(top, mix(at(x0, y1), at(x1, y1), fx), fy))
+}
+
+fn wrap_pixel(uv: f32, size: u32) -> f32 {
+    let size = size as f32;
+    let x = uv.rem_euclid(1.0) * size - 0.5;
+    if x < 0.0 {
+        x + size
+    } else {
+        x
+    }
 }
 
 fn read_reported(

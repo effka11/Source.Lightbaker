@@ -1,26 +1,24 @@
 use glam::Vec3;
 use rayon::prelude::*;
 
-use crate::embree::Scene;
-use crate::geom::{Area, Receiver, Role, Triangle, Volume};
+use crate::embree::{Hit, Scene};
+use crate::geom::{Area, Receiver, Triangle, Volume};
 use crate::shell::sealed_areas;
 use crate::walls::WallIndex;
 
 const MIN_DISTANCE: f32 = 1.0e-2;
-/// Inverse square of a fist-sized patch with a fluorescent's intensity is a
-/// white point on its shell and black a step away. This radius keeps that
-/// near field finite. A sun disk is already wider, so it barely changes.
+/// Half-brightness distance of a lamp that does not set its own. A wider
+/// emitter, such as the sun, already falls off from its own size.
 pub const LAMP_REACH: f32 = 48.0;
+/// Brightness at this distance stays put when the reach changes, so the
+/// control moves the pool instead of dimming the lamp.
+const ANCHOR: f32 = 96.0;
 pub(crate) const RAY_LIFT: f32 = 0.5;
 const HIT_SLOP: f32 = 1.0e-3;
 const BOUNCES: u32 = 2;
 /// Direct light and each bounce. One progress unit per receiver per pass.
 pub const RAY_PASSES: u64 = 1 + BOUNCES as u64;
 const TRACE: f32 = 1.0e6;
-/// Floors dimmer than this fraction of the bounce already in the room are lifted.
-const LIFT_DARK: f32 = 0.1;
-const LIFT_MIX: f32 = 0.7;
-
 #[derive(Clone, Debug, PartialEq)]
 pub struct Solved {
     pub light: Vec<[f32; 3]>,
@@ -99,9 +97,6 @@ fn solve_inner(
         arriving = bounced;
         lap("bounce");
     }
-    // Almost-black floors move toward bounce that already landed. No point in the room.
-    lift_floors(&mut light, &direct, receivers);
-    lap("lift");
     Solved { light, sealed }
 }
 
@@ -147,9 +142,12 @@ pub(crate) fn unoccluded_intensity(area: &Area, position: Vec3) -> f32 {
     }
     let nearest = nearest_point(area, position);
     let distance = (nearest - position).length();
-    let reach = reach(area);
-    let denom = distance * distance + reach * reach;
-    area.intensity() / denom.max(MIN_DISTANCE)
+    let soft = area.reach().max(emitter_radius(area)).max(1.0);
+    let legacy = emitter_radius(area).max(LAMP_REACH);
+    let anchor2 = ANCHOR * ANCHOR;
+    let gain = (soft * soft + anchor2) / (legacy * legacy + anchor2);
+    let denom = distance * distance + soft * soft;
+    area.intensity() * gain / denom.max(MIN_DISTANCE)
 }
 
 fn volume_contains(volume: &Volume, point: Vec3) -> bool {
@@ -161,8 +159,8 @@ fn volume_contains(volume: &Volume, point: Vec3) -> bool {
     inside(volume.axis_x) && inside(volume.axis_y) && inside(volume.axis_z)
 }
 
-fn reach(area: &Area) -> f32 {
-    let radius = match area {
+fn emitter_radius(area: &Area) -> f32 {
+    match area {
         Area::Rectangle(rectangle) => rectangle.half_u.length().hypot(rectangle.half_v.length()),
         Area::Disk(disk) => disk.radius.max(0.0),
         Area::Volume(_) => 0.0,
@@ -171,8 +169,7 @@ fn reach(area: &Area) -> f32 {
             .length()
             .max(omni.axis_y.length())
             .max(omni.axis_z.length()),
-    };
-    radius.max(LAMP_REACH)
+    }
 }
 
 /// Direct light with the patch fully visible. No rays, bounce, or floor lift.
@@ -280,13 +277,21 @@ fn fraction(scene: Option<&Scene>, receiver: &Receiver, area: &Area) -> f32 {
     if normal == Vec3::ZERO || unoccluded_intensity(area, receiver.position) < 1.0 / 64.0 {
         return 0.0;
     }
-    let origin = receiver.position + normal * RAY_LIFT;
+    let Some(scene) = scene else {
+        let origin = receiver.position + normal * RAY_LIFT;
+        return if area_reaches(origin, normal, area) {
+            1.0
+        } else {
+            0.0
+        };
+    };
+    if above_the_ceiling(scene, receiver.position, normal) {
+        return 0.0;
+    }
+    let origin = eye(scene, receiver.position, normal);
     if !area_reaches(origin, normal, area) {
         return 0.0;
     }
-    let Some(scene) = scene else {
-        return 1.0;
-    };
     // A door frame covers a tiny patch completely, so every ray agrees and the
     // luxel goes black. A lamp-sized spread leaves part of the disk clear.
     let spread = penumbra(patch_span(area));
@@ -316,7 +321,11 @@ fn fraction(scene: Option<&Scene>, receiver: &Receiver, area: &Area) -> f32 {
             open += 1.0;
         }
     }
-    if used == 0.0 { 0.0 } else { open / used }
+    if used == 0.0 {
+        0.0
+    } else {
+        open / used
+    }
 }
 
 /// How far a lamp's shadow samples spread past the metal itself.
@@ -408,7 +417,10 @@ fn direct(scene: &Scene, receiver: &Receiver, area: &Area, rays: u32) -> [f32; 3
         return [0.0, 0.0, 0.0];
     }
 
-    let origin = receiver.position + normal * RAY_LIFT;
+    if above_the_ceiling(scene, receiver.position, normal) {
+        return [0.0, 0.0, 0.0];
+    }
+    let origin = eye(scene, receiver.position, normal);
     if !area_reaches(origin, normal, area) {
         return [0.0, 0.0, 0.0];
     }
@@ -481,7 +493,10 @@ fn bounce_one(
     if normal == Vec3::ZERO || rays == 0 {
         return [0.0, 0.0, 0.0];
     }
-    let origin = receiver.position + normal * RAY_LIFT;
+    if above_the_ceiling(scene, receiver.position, normal) {
+        return [0.0, 0.0, 0.0];
+    }
+    let origin = eye(scene, receiver.position, normal);
     let mut sum = [0.0, 0.0, 0.0];
     for index in 0..rays {
         let direction = hemisphere_dir(normal, index, rays);
@@ -495,54 +510,6 @@ fn bounce_one(
     }
     let scale = rays as f32;
     sum.map(|channel| channel / scale)
-}
-
-fn lift_floors(light: &mut [[f32; 3]], direct: &[[f32; 3]], receivers: &[Receiver]) {
-    let Some(target) = bounce_target(light, direct, receivers) else {
-        return;
-    };
-    let reach = luma(target) * LIFT_DARK;
-    if reach <= 1.0e-6 {
-        return;
-    }
-    for (index, receiver) in receivers.iter().enumerate() {
-        if receiver.role != Role::Floor {
-            continue;
-        }
-        let current = light[index];
-        let brightness = luma(current);
-        if brightness >= reach {
-            continue;
-        }
-        let darkness = 1.0 - brightness / reach;
-        light[index] = mix(current, target, darkness * LIFT_MIX);
-    }
-}
-
-fn bounce_target(
-    light: &[[f32; 3]],
-    direct: &[[f32; 3]],
-    receivers: &[Receiver],
-) -> Option<[f32; 3]> {
-    let mut bounced = Vec::new();
-    for index in 0..receivers.len() {
-        let color = sub_color(light[index], direct[index]);
-        if luma(color) <= 1.0e-5 {
-            continue;
-        }
-        bounced.push(color);
-    }
-    if bounced.is_empty() {
-        return None;
-    }
-    bounced.sort_by(|left, right| luma(*left).total_cmp(&luma(*right)));
-    let upper = &bounced[bounced.len() / 2..];
-    let mut sum = [0.0, 0.0, 0.0];
-    for color in upper {
-        add_color(&mut sum, *color);
-    }
-    let scale = upper.len() as f32;
-    Some(sum.map(|channel| channel / scale))
 }
 
 fn nearest_point(area: &Area, point: Vec3) -> Vec3 {
@@ -703,14 +670,45 @@ fn planar_extent(axis: Vec3, bitangent: Vec3, direction: Vec3) -> f32 {
 const SHELL_BACK: f32 = 72.0;
 /// Leave the lit surface before counting a hit, so a graze is not a stripe.
 const RAY_SKIP: f32 = 1.0;
+/// A header that has pushed this far through the slab is still indoors.
+const CEILING_POKE: f32 = 1.25;
 
-fn arrives(
-    scene: &Scene,
-    origin: Vec3,
-    sample: Vec3,
-    receiver_normal: Vec3,
-    area: &Area,
-) -> bool {
+/// How far a sample buried in a door frame may step out into the room.
+/// A nearby wall is farther than this, so the step does not cross it.
+const ESCAPE: f32 = 1.25;
+
+/// The ray starts in the room. A lift that steps through the ceiling would
+/// begin on the far side of it, and the moon would light the frame.
+/// A prop built into the frame is inside that brush: the outward ray leaves
+/// through the back of a face, and until it does every lamp is blocked.
+fn eye(scene: &Scene, position: Vec3, normal: Vec3) -> Vec3 {
+    let Some(hit) = scene.hit(position + normal * 0.02, normal, ESCAPE) else {
+        return position + normal * RAY_LIFT;
+    };
+    if hit.backface {
+        let leave = (hit.distance + 0.05).min(ESCAPE);
+        return position + normal * leave;
+    }
+    if cover_face(normal, &hit) && hit.distance <= RAY_LIFT {
+        let stay = (hit.distance - 0.05).clamp(0.02, RAY_LIFT);
+        return position + normal * stay;
+    }
+    position + normal * RAY_LIFT
+}
+
+/// Top of a door frame sitting in the slab. Down hits the ceiling from above.
+fn above_the_ceiling(scene: &Scene, position: Vec3, normal: Vec3) -> bool {
+    if normal.z < 0.3 {
+        return false;
+    }
+    let down = -Vec3::Z;
+    let Some(hit) = scene.hit(position + down * 0.02, down, CEILING_POKE) else {
+        return false;
+    };
+    hit.backface && hit.normal.z > 0.5
+}
+
+fn arrives(scene: &Scene, origin: Vec3, sample: Vec3, receiver_normal: Vec3, area: &Area) -> bool {
     let delta = sample - origin;
     let distance = delta.length();
     if distance <= HIT_SLOP {
@@ -728,6 +726,11 @@ fn arrives(
     if limit <= RAY_SKIP {
         return true;
     }
+    // The skip leaves the receiver. A ceiling one unit ahead must still count,
+    // or the ray starts above the slab and the frame is lit.
+    if crosses_a_cover(scene, origin, direction, RAY_SKIP, receiver_normal, area) {
+        return false;
+    }
     // A graze on the receiver is a stripe. The fixture and the brush it sits
     // on are at the end of the ray; those hits are not a wall.
     let start = origin + direction * RAY_SKIP;
@@ -739,6 +742,44 @@ fn arrives(
         Some(hit) if on_source(area, hit.point) || near_lamp(area, hit.point) => true,
         _ => false,
     }
+}
+
+fn crosses_a_cover(
+    scene: &Scene,
+    origin: Vec3,
+    direction: Vec3,
+    skip: f32,
+    receiver_normal: Vec3,
+    area: &Area,
+) -> bool {
+    let mut cursor = origin;
+    let mut left = skip;
+    for _ in 0..4 {
+        let Some(hit) = scene.hit(cursor, direction, left) else {
+            return false;
+        };
+        if !same_face(receiver_normal, &hit)
+            && !on_source(area, hit.point)
+            && !near_lamp(area, hit.point)
+        {
+            return true;
+        }
+        let step = hit.distance + 0.05;
+        if step >= left {
+            return false;
+        }
+        cursor += direction * step;
+        left -= step;
+    }
+    false
+}
+
+fn cover_face(receiver_normal: Vec3, hit: &Hit) -> bool {
+    !hit.backface && !same_face(receiver_normal, hit)
+}
+
+fn same_face(receiver_normal: Vec3, hit: &Hit) -> bool {
+    !hit.backface && hit.normal.dot(receiver_normal) > 0.5
 }
 
 fn patch_span(area: &Area) -> f32 {
@@ -860,22 +901,6 @@ fn add_color(slot: &mut [f32; 3], add: [f32; 3]) {
     slot[2] += add[2];
 }
 
-fn sub_color(left: [f32; 3], right: [f32; 3]) -> [f32; 3] {
-    [left[0] - right[0], left[1] - right[1], left[2] - right[2]]
-}
-
-fn mix(from: [f32; 3], to: [f32; 3], factor: f32) -> [f32; 3] {
-    [
-        from[0] + (to[0] - from[0]) * factor,
-        from[1] + (to[1] - from[1]) * factor,
-        from[2] + (to[2] - from[2]) * factor,
-    ]
-}
-
-fn luma(color: [f32; 3]) -> f32 {
-    color[0] * 0.2126 + color[1] * 0.7152 + color[2] * 0.0722
-}
-
 #[cfg(test)]
 mod progress {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -892,6 +917,7 @@ mod progress {
             normal: -Vec3::Z,
             intensity: 1000.0,
             color: Vec3::ONE,
+            reach: super::LAMP_REACH,
         })
     }
 

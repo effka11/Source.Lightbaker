@@ -29,6 +29,8 @@ pub struct Rectangle {
     pub normal: Vec3,
     pub intensity: f32,
     pub color: Vec3,
+    /// Distance where this light is half as bright as it is on its shell.
+    pub reach: f32,
 }
 
 impl Rectangle {
@@ -52,6 +54,8 @@ pub struct Disk {
     pub axis: Vec3,
     pub intensity: f32,
     pub color: Vec3,
+    /// Distance where this light is half as bright as it is on its shell.
+    pub reach: f32,
 }
 
 impl Disk {
@@ -84,6 +88,8 @@ pub struct Volume {
     pub axis_z: Vec3,
     pub intensity: f32,
     pub color: Vec3,
+    /// Distance where this light is half as bright as it is on its shell.
+    pub reach: f32,
 }
 
 /// Light at the center of a solid figure. No face, so the hull does not cut the room.
@@ -96,6 +102,8 @@ pub struct Omni {
     pub axis_z: Vec3,
     pub intensity: f32,
     pub color: Vec3,
+    /// Distance where this light is half as bright as it is on its shell.
+    pub reach: f32,
 }
 
 /// Emitting patch handed to the solver.
@@ -140,6 +148,15 @@ impl Area {
             Area::Disk(disk) => disk.color,
             Area::Volume(volume) => volume.color,
             Area::Omni(omni) => omni.color,
+        }
+    }
+
+    pub fn reach(self) -> f32 {
+        match self {
+            Area::Rectangle(rectangle) => rectangle.reach,
+            Area::Disk(disk) => disk.reach,
+            Area::Volume(volume) => volume.reach,
+            Area::Omni(omni) => omni.reach,
         }
     }
 }

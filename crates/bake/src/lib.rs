@@ -10,6 +10,7 @@ const FULL_RAYS: u32 = 256;
 pub fn bake(
     triangles: &[Triangle],
     receivers: &[Receiver],
+    charts: &[[f32; 3]],
     areas: &[Area],
     snapshot: &Snapshot,
     source: &Path,
@@ -18,6 +19,7 @@ pub fn bake(
     bake_reporting(
         triangles,
         receivers,
+        charts,
         areas,
         snapshot,
         source,
@@ -31,6 +33,7 @@ pub fn bake(
 pub fn bake_reporting(
     triangles: &[Triangle],
     receivers: &[Receiver],
+    charts: &[[f32; 3]],
     areas: &[Area],
     snapshot: &Snapshot,
     source: &Path,
@@ -39,11 +42,29 @@ pub fn bake_reporting(
 ) -> Result<(), write::Error> {
     let solved = solve_reporting(triangles, receivers, areas, FULL_RAYS, report);
     let lights = placed_lights(areas);
-    write::write(snapshot, &solved.light, &lights, source, destination)
+    let albedo: Vec<[f32; 3]> = receivers
+        .iter()
+        .enumerate()
+        .map(|(index, receiver)| {
+            charts.get(index).copied().unwrap_or([
+                receiver.albedo.x,
+                receiver.albedo.y,
+                receiver.albedo.z,
+            ])
+        })
+        .collect();
+    write::write(
+        snapshot,
+        &solved.light,
+        &albedo,
+        &lights,
+        source,
+        destination,
+    )
 }
 
 /// One worldlight per lamp. A solid figure is a volume plus an omni at the
-/// same point; the brighter of the two is the entity.
+/// same point; the brighter of the two is kept.
 fn placed_lights(areas: &[Area]) -> Vec<write::PlacedLight> {
     let mut lights: Vec<write::PlacedLight> = Vec::new();
     for area in areas {

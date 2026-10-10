@@ -16,8 +16,9 @@ use glam::{Mat4, Vec3, Vec4};
 use lamps::Kind;
 use map::Luxel;
 use project::{
-    apply_base, base_label, capture_base, kind_label, read_lights, read_project, relapse_fixtures,
-    write_lights, write_project, Base, DoorChoice, DoorState, LightObject, Space, RELAPSE,
+    base_label, bring_to_base, capture_base, kind_label, read_lights, read_project,
+    relapse_fixtures, write_lights, write_project, Base, DoorChoice, DoorState, LightObject, Space,
+    REACH_MAX, RELAPSE,
 };
 use solve::{
     broad_light, dynamic, solve_reporting, Area, Cover, Receiver, Role, Triangle, RAY_PASSES,
@@ -634,7 +635,13 @@ struct Lightbaker {
     marker_positions: Option<Arc<Vec<[f32; 3]>>>,
     marker_colors: Option<Arc<Vec<[f32; 3]>>>,
     marker_id: u64,
+    /// Rebuilds the fixture mesh once per frame. The other views reuse it.
+    marker_frame: u64,
+    view_frame: u64,
     camera: Camera,
+    /// Last time the walk step was measured. egui's frame delta collapses to 1/60
+    /// after a delayed repaint, which makes straight-line movement crawl.
+    camera_tick: Instant,
     cursor_held: bool,
     selected: Vec<usize>,
     /// List row a Shift-click ranges from.
@@ -816,6 +823,8 @@ impl Lightbaker {
             marker_positions: None,
             marker_colors: None,
             marker_id: 0,
+            marker_frame: u64::MAX,
+            view_frame: 0,
             camera: Camera {
                 yaw: 0.8,
                 pitch: 0.7,
@@ -823,6 +832,7 @@ impl Lightbaker {
                 target: Vec3::ZERO,
                 noclip: false,
             },
+            camera_tick: Instant::now(),
             cursor_held: false,
             selected: Vec::new(),
             select_anchor: None,
@@ -1403,6 +1413,7 @@ impl Lightbaker {
         let areas = self.areas();
         let triangles = Arc::clone(&self.triangles);
         let receivers = Arc::clone(&self.receivers);
+        let charts: Vec<[f32; 3]> = self.luxels.iter().map(|luxel| luxel.chart).collect();
         let source = self.path.clone();
         let destination = if self.export_path.trim().is_empty() {
             beside(&self.path)
@@ -1418,6 +1429,7 @@ impl Lightbaker {
             let outcome = bake::bake_reporting(
                 &triangles,
                 &receivers,
+                &charts,
                 &areas,
                 &snapshot,
                 &source,
@@ -1463,16 +1475,27 @@ impl Lightbaker {
         }
     }
 
-    fn drive_camera(&mut self, ctx: &egui::Context) {
-        if self.error.is_none() && !ctx.wants_keyboard_input() {
-            self.move_camera(ctx);
-        }
-        self.aim(ctx);
-        self.hold_cursor(ctx);
+    fn frame_dt(&mut self) -> f32 {
+        let now = Instant::now();
+        let dt = now
+            .saturating_duration_since(self.camera_tick)
+            .as_secs_f32();
+        self.camera_tick = now;
+        dt
     }
 
-    fn move_camera(&mut self, ctx: &egui::Context) {
-        let (forward, strafe, vertical, toggle_noclip, fast, dt) = ctx.input(|input| {
+    /// `true` while the user is walking or turning, even on a frame that did not
+    /// change the pose. A zero-delta frame must not look like a still camera.
+    fn drive_camera(&mut self, ctx: &egui::Context, dt: f32) -> bool {
+        let steering =
+            self.error.is_none() && !ctx.wants_keyboard_input() && self.move_camera(ctx, dt);
+        let looked = self.aim(ctx);
+        self.hold_cursor(ctx);
+        steering || looked
+    }
+
+    fn move_camera(&mut self, ctx: &egui::Context, dt: f32) -> bool {
+        let (forward, strafe, vertical, toggle_noclip, fast) = ctx.input(|input| {
             let mut forward = 0.0;
             let mut strafe = 0.0;
             let mut vertical = 0.0;
@@ -1500,22 +1523,35 @@ impl Lightbaker {
                 vertical,
                 input.key_pressed(egui::Key::V) && !input.modifiers.command,
                 input.modifiers.shift,
-                input.stable_dt,
             )
         });
         if toggle_noclip {
             self.camera.noclip = !self.camera.noclip;
-            ctx.request_repaint();
         }
-        if self.camera.translate(forward, strafe, vertical, dt, fast) {
+        let steering = forward != 0.0 || strafe != 0.0 || (self.camera.noclip && vertical != 0.0);
+        if steering {
+            self.camera.translate(forward, strafe, vertical, dt, fast);
+        }
+        steering
+    }
+
+    /// Full speed while the view is up. The 20 Hz pause is only for a bake,
+    /// a shadow pass, or a light solve whose camera did not move this frame.
+    fn pace_view(&self, ctx: &egui::Context, camera_moved: bool) {
+        let baking = self.bake_rx.is_some() || self.solve_rx.is_some() || self.shadow_rx.is_some();
+        // A held slider has to paint every frame. The bake pause would step the fixture.
+        let dragging = ctx.dragged_id().is_some();
+        if baking && !camera_moved && !dragging {
+            ctx.request_repaint_after(Duration::from_millis(50));
+        } else if self.opening.is_some() || !self.luxels.is_empty() {
             ctx.request_repaint();
         }
     }
 
     /// In noclip the cursor stays put, so the turn comes from the raw mouse motion.
-    fn aim(&mut self, ctx: &egui::Context) {
+    fn aim(&mut self, ctx: &egui::Context) -> bool {
         if !self.camera.noclip || self.error.is_some() {
-            return;
+            return false;
         }
         let (delta, middle) = ctx.input(|input| {
             let scale = input.pixels_per_point.max(0.1);
@@ -1529,13 +1565,14 @@ impl Lightbaker {
             )
         });
         if delta == egui::Vec2::ZERO {
-            return;
+            return false;
         }
         if middle {
             self.camera.orbit(delta);
         } else {
             self.camera.look(delta);
         }
+        true
     }
 
     /// Freeze the cursor in the window for as long as noclip is on and the window is focused.
@@ -1771,11 +1808,16 @@ impl Lightbaker {
                 object.position += delta;
             }
         }
-        self.preview_lamp();
+        // Mesh follows the pointer. The lightmap waits for release, same as the panel sliders.
         self.lamp_moved = true;
     }
 
     fn markers(&mut self) -> (Arc<Vec<[f32; 3]>>, Arc<Vec<[f32; 3]>>, u64) {
+        if self.marker_frame == self.view_frame {
+            if let (Some(positions), Some(colors)) = (&self.marker_positions, &self.marker_colors) {
+                return (Arc::clone(positions), Arc::clone(colors), self.marker_id);
+            }
+        }
         let mut positions = Vec::new();
         let mut colors = Vec::new();
         let mut cursor = 0usize;
@@ -1833,6 +1875,7 @@ impl Lightbaker {
             self.marker_colors = Some(Arc::new(colors));
             self.marker_id = self.marker_id.wrapping_add(1);
         }
+        self.marker_frame = self.view_frame;
         (
             Arc::clone(self.marker_positions.as_ref().expect("marker positions")),
             Arc::clone(self.marker_colors.as_ref().expect("marker colors")),
@@ -1843,6 +1886,8 @@ impl Lightbaker {
 
 impl eframe::App for Lightbaker {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.view_frame = self.view_frame.wrapping_add(1);
+        let dt = self.frame_dt();
         self.poll_opening();
         self.poll_shadows();
         self.take_drop(ctx);
@@ -1850,23 +1895,17 @@ impl eframe::App for Lightbaker {
         self.chrome(ctx);
         if self.opening.is_some() {
             draw_loading(ctx, self.opening.as_ref().expect("opening"));
-            ctx.request_repaint_after(Duration::from_millis(50));
+            self.pace_view(ctx, false);
             return;
         }
+        let yaw = self.camera.yaw;
+        let pitch = self.camera.pitch;
+        let distance = self.camera.distance;
+        let target = self.camera.target;
         self.poll_bake();
-        self.drive_camera(ctx);
-        if self.bake_rx.is_some() || self.shadow_rx.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(50));
-        }
+        let steering = self.drive_camera(ctx, dt);
         if self.solve_rx.is_some() {
-            let finished = self.poll_solve();
-            if self.solve_rx.is_some() {
-                if finished {
-                    ctx.request_repaint();
-                } else {
-                    ctx.request_repaint_after(Duration::from_millis(50));
-                }
-            }
+            self.poll_solve();
         }
 
         if self.choose && self.luxels.is_empty() {
@@ -1895,6 +1934,12 @@ impl eframe::App for Lightbaker {
         self.export_window(ctx);
         self.object_actions(ctx);
         self.door_actions(ctx);
+        let camera_moved = steering
+            || self.camera.yaw != yaw
+            || self.camera.pitch != pitch
+            || self.camera.distance != distance
+            || self.camera.target != target;
+        self.pace_view(ctx, camera_moved);
     }
 }
 
@@ -2706,7 +2751,7 @@ impl Lightbaker {
         let margin = 16.0;
         let gap = 12.0;
         let frame = 14.0;
-        let object_inner = 360.0;
+        let object_inner = 420.0;
         let object_outer = object_inner + frame;
         {
             let objects = &self.objects;
@@ -2715,6 +2760,7 @@ impl Lightbaker {
                 .pivot(egui::Align2::RIGHT_TOP)
                 .default_pos(Pos2::new(screen.right() - margin, top))
                 .default_width(object_inner)
+                .min_width(object_inner)
                 .default_height(32.0)
                 .resizable(true)
                 .show(ctx, |ui| {
@@ -2810,18 +2856,26 @@ impl Lightbaker {
                             }
                         });
                         ui.label("Грани");
-                        let size_x = keep(
+                        pending.size[0] = motion_row(
+                            ui,
                             &mut pending,
                             true,
-                            mix_drag(ui, size_shared[0], size_fallback[0], "X ", 1.0),
+                            size_shared[0],
+                            size_fallback[0],
+                            "X ",
+                            0,
+                            true,
                         );
-                        pending.size[0] = size_x;
-                        let size_y = keep(
+                        pending.size[1] = motion_row(
+                            ui,
                             &mut pending,
                             true,
-                            mix_drag(ui, size_shared[1], size_fallback[1], "Y ", 1.0),
+                            size_shared[1],
+                            size_fallback[1],
+                            "Y ",
+                            1,
+                            true,
                         );
-                        pending.size[1] = size_y;
                         let any_solid = indices
                             .iter()
                             .any(|index| objects[*index].space == Space::Solid);
@@ -2831,32 +2885,48 @@ impl Lightbaker {
                             None => any_solid,
                         };
                         if show_z {
-                            let size_z = keep(
+                            pending.size[2] = motion_row(
+                                ui,
                                 &mut pending,
                                 true,
-                                mix_drag(ui, size_shared[2], size_fallback[2], "Z ", 1.0),
+                                size_shared[2],
+                                size_fallback[2],
+                                "Z ",
+                                2,
+                                true,
                             );
-                            pending.size[2] = size_z;
                         }
                         ui.label("Положение");
-                        let position_x = keep(
+                        pending.position[0] = motion_row(
+                            ui,
                             &mut pending,
                             false,
-                            mix_drag(ui, position_shared[0], position_fallback[0], "X ", 1.0),
+                            position_shared[0],
+                            position_fallback[0],
+                            "X ",
+                            0,
+                            false,
                         );
-                        pending.position[0] = position_x;
-                        let position_y = keep(
+                        pending.position[1] = motion_row(
+                            ui,
                             &mut pending,
                             false,
-                            mix_drag(ui, position_shared[1], position_fallback[1], "Y ", 1.0),
+                            position_shared[1],
+                            position_fallback[1],
+                            "Y ",
+                            1,
+                            false,
                         );
-                        pending.position[1] = position_y;
-                        let position_z = keep(
+                        pending.position[2] = motion_row(
+                            ui,
                             &mut pending,
                             false,
-                            mix_drag(ui, position_shared[2], position_fallback[2], "Z ", 1.0),
+                            position_shared[2],
+                            position_fallback[2],
+                            "Z ",
+                            2,
+                            false,
                         );
-                        pending.position[2] = position_z;
                         ui.label("Поворот");
                         let yaw = keep(
                             &mut pending,
@@ -2892,21 +2962,21 @@ impl Lightbaker {
                             .size(12.0)
                             .color(Color32::from_rgb(150, 150, 156)),
                         );
-                        ui.separator();
-                        if ui.button("Сохранить как базовые параметры").clicked() {
-                            save_base = true;
-                        }
-                        if ui.button("Привести к базовым параметрам").clicked() {
-                            use_base = true;
-                        }
-                        ui.label(
-                            RichText::new(
-                                "Имя, категория и положение остаются. Остальное — база новых источников.",
-                            )
-                            .size(12.0)
-                            .color(Color32::from_rgb(150, 150, 156)),
-                        );
                     });
+                    ui.separator();
+                    if ui.button("Сохранить как базовые параметры").clicked() {
+                        save_base = true;
+                    }
+                    if ui.button("Привести к базовым параметрам").clicked() {
+                        use_base = true;
+                    }
+                    ui.label(
+                        RichText::new(
+                            "Имя, категория и положение остаются. Сила и дальность — из кода этого светильника.",
+                        )
+                        .size(12.0)
+                        .color(Color32::from_rgb(150, 150, 156)),
+                    );
                 });
 
             egui::Window::new("Свет")
@@ -2920,6 +2990,8 @@ impl Lightbaker {
                     let intensity_shared =
                         shared_number(objects, &indices, |object| object.intensity);
                     let intensity_fallback = objects[indices[0]].intensity;
+                    let reach_shared = shared_number(objects, &indices, |object| object.reach);
+                    let reach_fallback = objects[indices[0]].reach;
                     let color_shared = shared_color(objects, &indices);
                     let color_fallback = objects[indices[0]].color.to_array();
                     let channel_shared = [
@@ -2936,13 +3008,24 @@ impl Lightbaker {
                     let spread_fallback = objects[indices[0]].spread;
                     let mesh_fallback = objects[indices[0]].mesh;
                     ui.add_enabled_ui(editing, |ui| {
-                        ui.label("Сила и цвет площадки");
+                        ui.label("Сила, дальность и цвет");
                         let intensity = keep(
                             &mut pending,
                             true,
                             mix_drag(ui, intensity_shared, intensity_fallback, "", 100.0),
                         );
                         pending.intensity = intensity;
+                        let reach = keep(
+                            &mut pending,
+                            true,
+                            mix_drag(ui, reach_shared, reach_fallback, "Дальность ", 8.0),
+                        );
+                        pending.reach = reach;
+                        ui.label(
+                            RichText::new("Дальность — где свет падает вдвое, в юнитах")
+                                .size(12.0)
+                                .color(Color32::from_rgb(150, 150, 156)),
+                        );
                         let mut rgb = color_shared
                             .unwrap_or(Vec3::from_array(color_fallback))
                             .to_array();
@@ -3046,7 +3129,7 @@ impl Lightbaker {
         if use_base {
             let base = base::live();
             for index in &indices {
-                apply_base(&mut self.objects[*index], &base);
+                bring_to_base(&mut self.objects[*index], &base);
             }
             pending.commit = true;
         }
@@ -3065,9 +3148,11 @@ impl Lightbaker {
             self.undo_group = false;
         }
         self.draft_category = draft;
+        // A drag of position or size only moves the mesh. Rebuilding the
+        // lightmap on every tick is what made the fixture stutter.
         if pending.commit {
             self.lamps_moved();
-        } else if pending.preview {
+        } else if pending.preview && pending.light {
             self.preview_lamp();
         }
     }
@@ -3688,6 +3773,8 @@ fn aspect_of(ui: &egui::Ui, rect: Rect) -> f32 {
 struct Edit {
     preview: bool,
     commit: bool,
+    /// Position and size. The mesh follows the pointer; the lightmap waits.
+    defer: bool,
 }
 
 #[derive(Default)]
@@ -3700,6 +3787,7 @@ struct Pending {
     rotation: [Option<f32>; 3],
     corners: Option<f32>,
     intensity: Option<f32>,
+    reach: Option<f32>,
     color: Option<Vec3>,
     channels: [Option<f32>; 3],
     inside: Option<f32>,
@@ -3709,6 +3797,8 @@ struct Pending {
     preview: bool,
     commit: bool,
     shape: bool,
+    /// Preview that is not only a move or a resize, so the lightmap updates now.
+    light: bool,
 }
 
 impl Pending {
@@ -3721,6 +3811,7 @@ impl Pending {
             || self.rotation.iter().any(Option::is_some)
             || self.corners.is_some()
             || self.intensity.is_some()
+            || self.reach.is_some()
             || self.color.is_some()
             || self.channels.iter().any(Option::is_some)
             || self.inside.is_some()
@@ -3734,6 +3825,9 @@ fn keep(pending: &mut Pending, shape: bool, change: (Option<f32>, Edit)) -> Opti
     let (value, edit) = change;
     pending.preview |= edit.preview;
     pending.commit |= edit.commit;
+    if edit.preview && !edit.defer {
+        pending.light = true;
+    }
     if value.is_some() && shape {
         pending.shape = true;
     }
@@ -3760,6 +3854,7 @@ fn mix_drag(
         Edit {
             preview: response.dragged(),
             commit: released(&response),
+            defer: false,
         },
     )
 }
@@ -3783,6 +3878,102 @@ fn mix_slider(
         Edit {
             preview: response.dragged(),
             commit: released(&response),
+            defer: false,
+        },
+    )
+}
+
+/// Number on the left, slider on the right. `faces` sizes the fixture; otherwise it moves it.
+fn motion_row(
+    ui: &mut egui::Ui,
+    pending: &mut Pending,
+    shape: bool,
+    shared: Option<f32>,
+    fallback: f32,
+    prefix: &str,
+    axis: u8,
+    faces: bool,
+) -> Option<f32> {
+    let change = ui
+        .horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            let drag = ui
+                .scope(|ui| {
+                    ui.set_width(132.0);
+                    mix_drag(ui, shared, fallback, prefix, 1.0)
+                })
+                .inner;
+            let slide = if faces {
+                mix_face_slider(ui, shared, fallback)
+            } else {
+                mix_place_slider(ui, shared, fallback, axis)
+            };
+            (
+                slide.0.or(drag.0),
+                Edit {
+                    preview: drag.1.preview || slide.1.preview,
+                    commit: drag.1.commit || slide.1.commit,
+                    defer: true,
+                },
+            )
+        })
+        .inner;
+    keep(pending, shape, change)
+}
+
+fn mix_face_slider(ui: &mut egui::Ui, shared: Option<f32>, fallback: f32) -> (Option<f32>, Edit) {
+    let start = shared.unwrap_or(fallback).max(1.0);
+    ui.spacing_mut().slider_width = ui.available_width().max(64.0);
+    let mut value = start;
+    let response = ui.add(
+        egui::Slider::new(&mut value, 1.0..=start.max(2048.0))
+            .logarithmic(true)
+            .integer()
+            .show_value(false)
+            .trailing_fill(true),
+    );
+    slide_edit(&response, value.round().max(1.0))
+}
+
+fn mix_place_slider(
+    ui: &mut egui::Ui,
+    shared: Option<f32>,
+    fallback: f32,
+    axis: u8,
+) -> (Option<f32>, Edit) {
+    let start = shared.unwrap_or(fallback);
+    ui.spacing_mut().slider_width = ui.available_width().max(96.0);
+    // The thumb is only a handle. The fixture follows the pointer one unit per point,
+    // including after the thumb reaches the end of the track.
+    let mut knob = 0.0;
+    let response = ui
+        .push_id(axis, |ui| {
+            ui.add(
+                egui::Slider::new(&mut knob, -1.0..=1.0)
+                    .show_value(false)
+                    .smart_aim(false)
+                    .trailing_fill(true),
+            )
+        })
+        .inner;
+    let next = (start + response.drag_delta().x).round();
+    (
+        (response.dragged() && next != start.round()).then_some(next),
+        Edit {
+            preview: response.dragged(),
+            commit: released(&response),
+            defer: true,
+        },
+    )
+}
+
+fn slide_edit(response: &Response, value: f32) -> (Option<f32>, Edit) {
+    (
+        response.changed().then_some(value),
+        Edit {
+            preview: response.dragged(),
+            commit: released(response),
+            defer: true,
         },
     )
 }
@@ -3892,6 +4083,9 @@ fn apply_pending(objects: &mut [LightObject], indices: &[usize], pending: &Pendi
         }
         if let Some(value) = pending.intensity {
             object.intensity = value.max(0.0);
+        }
+        if let Some(value) = pending.reach {
+            object.reach = value.clamp(32.0, REACH_MAX);
         }
         if let Some(color) = pending.color {
             object.color = color;
@@ -4057,6 +4251,7 @@ fn same_emission(left: &LightObject, right: &LightObject) -> bool {
         && left.rotation == right.rotation
         && left.corners == right.corners
         && left.intensity == right.intensity
+        && left.reach == right.reach
         && left.inside == right.inside
         && left.rim == right.rim
         && left.color == right.color
@@ -5318,6 +5513,7 @@ mod tests {
             normal: -Vec3::Z,
             intensity: 1.0,
             color: Vec3::ONE,
+            reach: solve::LAMP_REACH,
         })
     }
 

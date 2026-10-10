@@ -611,15 +611,15 @@ fn push_sample(luxels: &mut Vec<Luxel>, sample: Sample) {
     } else {
         tangent_quad(sample.position, normal, 3.0)
     };
-    luxels.push(Luxel {
-        receiver: Receiver {
+    luxels.push(Luxel::plain(
+        Receiver {
             position: sample.position,
             normal,
             albedo: Vec3::splat(0.5),
             role: role_of(normal),
         },
         corners,
-    });
+    ));
 }
 
 fn role_of(normal: Vec3) -> Role {

@@ -1,5 +1,5 @@
 use glam::Vec3;
-use solve::{solve, Area, Receiver, Rectangle, Role, Triangle};
+use solve::{solve, Area, Receiver, Rectangle, Role, Triangle, LAMP_REACH};
 
 fn other(position: Vec3, normal: Vec3) -> Receiver {
     Receiver {
@@ -78,6 +78,7 @@ fn downward(center: Vec3, intensity: f32) -> Area {
         normal: -Vec3::Z,
         intensity,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     })
 }
 
@@ -176,6 +177,7 @@ fn grate_gap_passes_and_bar_blocks() {
         normal: -Vec3::Z,
         intensity: 100.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     });
     let mut bars = Vec::new();
     bars.extend(quad(
@@ -201,7 +203,7 @@ fn grate_gap_passes_and_bar_blocks() {
 }
 
 #[test]
-fn lift_raises_only_an_almost_black_floor() {
+fn an_unlit_floor_stays_dark() {
     let light = downward(Vec3::new(0.0, 0.0, 24.0), 8_000.0);
     let surface = quad(
         Vec3::new(3.0, -12.0, 0.0),
@@ -230,8 +232,10 @@ fn lift_raises_only_an_almost_black_floor() {
     assert_eq!(solved.light[1], solved.light[2], "bright floor must stay");
     assert!(solved.light[1][0] > 1.0, "{:?}", solved.light[1]);
     assert_eq!(solved.light[4], [0.0, 0.0, 0.0]);
-    assert!(solved.light[3][0] > 0.0, "{:?}", solved.light[3]);
-    assert!(solved.light[3][0] < solved.light[1][0]);
+    assert_eq!(
+        solved.light[3], [0.0, 0.0, 0.0],
+        "a floor the lamp does not reach stays dark"
+    );
     let again = solve(&triangles, &receivers, &[light], 64);
     assert_eq!(solved, again);
 }

@@ -3,11 +3,14 @@
 //! The mock room is small enough that a full scan is the reference. A map has
 //! hundreds of thousands of walls and tens of millions of hits, two thirds of
 //! which land where no coplanar wall luxel exists at all. The same predicate is
-//! answered from a tree: luxels that share one exact normal form a subtree that
-//! is pruned by the offset of their plane, everything else is pruned by a cone
-//! of normals, and every node is pruned by the distance to its box. A miss then
-//! costs a walk down the tree, not a scan of the neighbourhood. Ties keep the
-//! smaller receiver index.
+//! answered from a tree. Walls are first dealt into six piles by the axis
+//! their normal leans toward, so a hit on a floor or a ceiling never opens the
+//! piles of vertical walls. Each pile is a tree over positions whose nodes
+//! also carry the box of their normals: a node is pruned when no normal in it
+//! can be aligned with the hit, when no plane through its box can pass near
+//! the hit point, or when its box is farther than the best luxel so far. A
+//! miss then costs a walk down one small tree, not a scan of the
+//! neighbourhood. Ties keep the smaller receiver index.
 
 use glam::Vec3;
 
@@ -19,17 +22,19 @@ const ALIGN: f32 = 0.5;
 const PLANE_EPS: f32 = 1.5;
 /// Rounding slack on the plane offset bound, in world units.
 const PLANE_SLACK: f32 = 0.1;
+/// Rounding slack on the alignment bound.
+const ALIGN_SLACK: f32 = 1.0e-4;
 const LEAF: usize = 8;
-/// Luxels sharing one exact normal form their own subtree from this many on.
-const MIN_GROUP: usize = 16;
 const NO_CHILD: u32 = u32::MAX;
 
 pub(crate) struct WallIndex {
     /// Wall receivers in leaf order.
     entries: Vec<Entry>,
     nodes: Vec<Node>,
-    /// Subtree roots: one per exact-normal group, then one for the rest.
+    /// Subtree roots: one per pile of normals that lean the same way.
     roots: Vec<u32>,
+    /// Root of each pile by its number, `NO_CHILD` for an empty pile.
+    pile: [u32; 6],
 }
 
 #[derive(Clone, Copy)]
@@ -43,12 +48,9 @@ struct Entry {
 struct Node {
     min: Vec3,
     max: Vec3,
-    /// Axis of the cone holding every normal below.
-    cone: Vec3,
-    /// Prune when `cone · hit_normal` is below this: no normal below can be aligned.
-    prune_cos: f32,
-    /// `Some` when every entry below has bitwise the same normal.
-    plane: Option<Plane>,
+    /// Box holding every normal below.
+    normal_min: Vec3,
+    normal_max: Vec3,
     /// Leaf: `[first, first + count)` in `entries`. Inner: children.
     first: u32,
     count: u32,
@@ -56,16 +58,9 @@ struct Node {
     right: u32,
 }
 
-#[derive(Clone, Copy)]
-struct Plane {
-    normal: Vec3,
-    lo: f32,
-    hi: f32,
-}
-
 impl WallIndex {
     pub(crate) fn build(receivers: &[Receiver]) -> Self {
-        let mut entries: Vec<Entry> = receivers
+        let entries: Vec<Entry> = receivers
             .iter()
             .enumerate()
             .filter(|(_, receiver)| receiver.role == Role::Wall)
@@ -85,37 +80,28 @@ impl WallIndex {
             entries: Vec::new(),
             nodes: Vec::new(),
             roots: Vec::new(),
+            pile: [NO_CHILD; 6],
         };
         if entries.is_empty() {
             return index;
         }
 
-        // Runs of one exact normal, largest groups first; the small ones share a tree.
-        entries.sort_unstable_by_key(|entry| normal_key(entry.normal));
-        let mut ordered = Vec::with_capacity(entries.len());
-        let mut rest = Vec::new();
-        let mut start = 0;
-        while start < entries.len() {
-            let key = normal_key(entries[start].normal);
-            let mut end = start;
-            while end < entries.len() && normal_key(entries[end].normal) == key {
-                end += 1;
-            }
-            if end - start >= MIN_GROUP {
-                let first = ordered.len();
-                ordered.extend_from_slice(&entries[start..end]);
-                let root = index.split(&mut ordered, first, end - start);
-                index.roots.push(root);
-            } else {
-                rest.extend_from_slice(&entries[start..end]);
-            }
-            start = end;
+        // One pile per leaning. The pile the hit itself leans toward is searched
+        // first; a pile whose normals cannot face the hit closes at its root.
+        let mut piles: Vec<Vec<Entry>> = vec![Vec::new(); 6];
+        for entry in entries {
+            piles[leaning(entry.normal)].push(entry);
         }
-        if !rest.is_empty() {
+        let mut ordered = Vec::new();
+        for (number, pile) in piles.into_iter().enumerate() {
+            if pile.is_empty() {
+                continue;
+            }
             let first = ordered.len();
-            ordered.extend_from_slice(&rest);
-            let root = index.split(&mut ordered, first, rest.len());
+            ordered.extend_from_slice(&pile);
+            let root = index.split(&mut ordered, first, pile.len());
             index.roots.push(root);
+            index.pile[number] = root;
         }
         index.entries = ordered;
         index
@@ -138,7 +124,17 @@ impl WallIndex {
         }
         let mut best: Option<(u32, f32)> = None;
         let mut bound = SEARCH * SEARCH;
+        // The pile the hit normal itself leans toward holds the coplanar
+        // luxels. Searching it first shrinks the bound before the other piles
+        // are opened, so most of them close on distance alone.
+        let own = self.pile[leaning(hit_normal)];
+        if own != NO_CHILD {
+            self.descend(own, point, hit_normal, gather as u32, &mut best, &mut bound);
+        }
         for &root in &self.roots {
+            if root == own {
+                continue;
+            }
             self.descend(
                 root,
                 point,
@@ -148,7 +144,6 @@ impl WallIndex {
                 &mut bound,
             );
         }
-        stats::lookup(best.map(|(_, distance)| distance.sqrt()));
         best.map(|(index, _)| index as usize)
     }
 
@@ -191,22 +186,13 @@ impl WallIndex {
         bound: &mut f32,
     ) {
         let node = &self.nodes[slot as usize];
-        stats::node();
-        if node.cone.dot(hit_normal) < node.prune_cos {
+        if box_distance_squared(node.min, node.max, point) > *bound {
             return;
         }
-        if let Some(plane) = node.plane {
-            if plane.normal.dot(hit_normal) < ALIGN {
-                return;
-            }
-            let offset = point.dot(plane.normal);
-            if offset < plane.lo - PLANE_EPS - PLANE_SLACK
-                || offset > plane.hi + PLANE_EPS + PLANE_SLACK
-            {
-                return;
-            }
+        if !node.may_align(hit_normal) {
+            return;
         }
-        if box_distance_squared(node.min, node.max, point) > *bound {
+        if !node.may_be_coplanar(point) {
             return;
         }
         if node.count > 0 {
@@ -234,131 +220,72 @@ impl Node {
     fn over(entries: &[Entry], first: u32, count: u32) -> Self {
         let mut min = Vec3::splat(f32::MAX);
         let mut max = Vec3::splat(f32::MIN);
-        let mut sum = Vec3::ZERO;
-        let key = normal_key(entries[0].normal);
-        let mut uniform = true;
+        let mut normal_min = Vec3::splat(f32::MAX);
+        let mut normal_max = Vec3::splat(f32::MIN);
         for entry in entries {
             min = min.min(entry.position);
             max = max.max(entry.position);
-            sum += entry.normal;
-            uniform &= normal_key(entry.normal) == key;
+            normal_min = normal_min.min(entry.normal);
+            normal_max = normal_max.max(entry.normal);
         }
-        let cone = sum.normalize_or_zero();
-        let cone = if cone == Vec3::ZERO {
-            entries[0].normal
-        } else {
-            cone
-        };
-        let widest = entries
-            .iter()
-            .map(|entry| entry.normal.dot(cone))
-            .fold(1.0f32, f32::min)
-            .clamp(-1.0, 1.0);
-        // Every normal lies within `half` of the cone axis. A hit normal farther
-        // than `half + 60°` from the axis is beyond 60° of all of them.
-        let half = widest.acos();
-        let reach = half + ALIGN.acos();
-        let prune_cos = if reach >= std::f32::consts::PI {
-            -2.0
-        } else {
-            // `acos` is steep near 1, so the bound is loosened by a little more
-            // than the rounding of `widest` can move it.
-            reach.cos() - 1.0e-3
-        };
-        let plane = uniform.then(|| {
-            let normal = entries[0].normal;
-            let mut lo = f32::MAX;
-            let mut hi = f32::MIN;
-            for entry in entries {
-                let offset = entry.position.dot(normal);
-                lo = lo.min(offset);
-                hi = hi.max(offset);
-            }
-            Plane { normal, lo, hi }
-        });
         Self {
             min,
             max,
-            cone,
-            prune_cos,
-            plane,
+            normal_min,
+            normal_max,
             first,
             count,
             left: NO_CHILD,
             right: NO_CHILD,
         }
     }
-}
 
-impl Drop for WallIndex {
-    fn drop(&mut self) {
-        stats::report();
-    }
-}
-
-/// Temporary counters for the gm_construct measurement. Removed before finishing.
-pub(crate) mod stats {
-    use std::cell::Cell;
-    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-
-    // lookups, misses, nodes, found <=32, <=64, <=128, <=256, <=768
-    const SLOTS: usize = 8;
-    static TOTALS: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
-
-    thread_local! {
-        static LOCAL: [Cell<u64>; SLOTS] = [const { Cell::new(0) }; SLOTS];
+    /// Some normal in the box may lie within 60° of the hit normal. The largest
+    /// dot product over a box is reached at one of its corners, one axis at a
+    /// time, so this is the same arithmetic as the entry test, only on bounds.
+    fn may_align(&self, hit_normal: Vec3) -> bool {
+        let most = (self.normal_min.x * hit_normal.x).max(self.normal_max.x * hit_normal.x)
+            + (self.normal_min.y * hit_normal.y).max(self.normal_max.y * hit_normal.y)
+            + (self.normal_min.z * hit_normal.z).max(self.normal_max.z * hit_normal.z);
+        most >= ALIGN - ALIGN_SLACK
     }
 
-    fn bump(slot: usize, by: u64) {
-        LOCAL.with(|local| local[slot].set(local[slot].get() + by));
-    }
-
-    pub fn node() {
-        bump(2, 1);
-    }
-
-    pub fn lookup(found: Option<f32>) {
-        bump(0, 1);
-        match found {
-            None => bump(1, 1),
-            Some(distance) => {
-                let slot = if distance <= 32.0 {
-                    3
-                } else if distance <= 64.0 {
-                    4
-                } else if distance <= 128.0 {
-                    5
-                } else if distance <= 256.0 {
-                    6
-                } else {
-                    7
-                };
-                bump(slot, 1);
-            }
+    /// Some plane through a position in the box, with a normal from the normal
+    /// box, may pass within `PLANE_EPS` of the point. The offset
+    /// `(point - position) · normal` is a sum of per-axis products, and each
+    /// product ranges over the corners of its own rectangle of bounds.
+    fn may_be_coplanar(&self, point: Vec3) -> bool {
+        let mut lo = 0.0f32;
+        let mut hi = 0.0f32;
+        for axis in 0..3 {
+            let near = point[axis] - self.max[axis];
+            let far = point[axis] - self.min[axis];
+            let n_lo = self.normal_min[axis];
+            let n_hi = self.normal_max[axis];
+            let corners = [near * n_lo, near * n_hi, far * n_lo, far * n_hi];
+            lo += corners.iter().copied().fold(f32::MAX, f32::min);
+            hi += corners.iter().copied().fold(f32::MIN, f32::max);
         }
-        LOCAL.with(|local| {
-            if local[0].get() % 4096 == 0 {
-                for (cell, total) in local.iter().zip(TOTALS.iter()) {
-                    total.fetch_add(cell.replace(0), Relaxed);
-                }
-            }
-        });
-    }
-
-    pub fn report() {
-        if std::env::var("LB_STATS").is_err() {
-            return;
-        }
-        let totals: Vec<u64> = TOTALS.iter().map(|total| total.load(Relaxed)).collect();
-        eprintln!(
-            "walls: lookups {} misses {} nodes {} found<=32 {} <=64 {} <=128 {} <=256 {} <=768 {}",
-            totals[0], totals[1], totals[2], totals[3], totals[4], totals[5], totals[6], totals[7]
-        );
+        lo <= PLANE_EPS + PLANE_SLACK && hi >= -(PLANE_EPS + PLANE_SLACK)
     }
 }
 
-fn normal_key(normal: Vec3) -> [u32; 3] {
-    [normal.x.to_bits(), normal.y.to_bits(), normal.z.to_bits()]
+/// Which axis a normal leans toward, as a pile number. The first axis whose
+/// component reaches `ALIGN` wins, so every unit normal lands in some pile.
+fn leaning(normal: Vec3) -> usize {
+    if normal.z >= ALIGN {
+        0
+    } else if normal.z <= -ALIGN {
+        1
+    } else if normal.x >= ALIGN {
+        2
+    } else if normal.x <= -ALIGN {
+        3
+    } else if normal.y >= ALIGN {
+        4
+    } else {
+        5
+    }
 }
 
 fn box_distance_squared(min: Vec3, max: Vec3, point: Vec3) -> f32 {

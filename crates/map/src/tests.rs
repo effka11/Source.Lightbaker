@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use glam::Vec3;
-use solve::{solve, Area, Rectangle, Role};
+use solve::{solve, Area, Rectangle, Role, LAMP_REACH};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -144,6 +144,7 @@ fn a_luxel_cut_by_a_wall_is_sampled_on_the_lit_side() {
         normal: -Vec3::Z,
         intensity: 8_000.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     });
     let lit = solve(&map.triangles, &[luxel.receiver], &[lamp], 16);
     assert!(lit.light[0][0] > 0.0, "cut luxel {:?}", lit.light[0]);
@@ -229,6 +230,7 @@ fn gm_construct_opens_and_feeds_the_same_solve() {
         normal: -Vec3::Z,
         intensity: 18_000.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     });
     let once = solve(&map.triangles, &receivers, &[area], 16);
     let twice = solve(&map.triangles, &receivers, &[area], 16);
@@ -245,14 +247,8 @@ fn a_wall_facing_into_its_slab_is_turned_toward_the_lamp() {
     let inward = receiver(Vec3::new(12.0, 0.0, 4.0), Vec3::Y);
     let outward = receiver(Vec3::new(12.0, 32.0, 4.0), Vec3::Y);
     let mut luxels = vec![
-        crate::Luxel {
-            receiver: inward,
-            corners: Vec::new(),
-        },
-        crate::Luxel {
-            receiver: outward,
-            corners: Vec::new(),
-        },
+        crate::Luxel::plain(inward, Vec::new()),
+        crate::Luxel::plain(outward, Vec::new()),
     ];
     let lamp = Area::Rectangle(Rectangle {
         center: Vec3::new(12.0, -24.0, 20.0),
@@ -261,6 +257,7 @@ fn a_wall_facing_into_its_slab_is_turned_toward_the_lamp() {
         normal: -Vec3::Z,
         intensity: 4_000.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     });
     let dark = solve(&triangles, &[inward], &[lamp], 16);
     assert_eq!(dark.light[0], [0.0, 0.0, 0.0]);
@@ -288,10 +285,10 @@ fn a_floor_under_a_low_ceiling_keeps_facing_up() {
             Vec3::new(16.0, 16.0, 32.0),
         ],
     };
-    let mut luxels = vec![crate::Luxel {
-        receiver: receiver(Vec3::new(12.0, 4.0, 0.0), Vec3::Z),
-        corners: Vec::new(),
-    }];
+    let mut luxels = vec![crate::Luxel::plain(
+        receiver(Vec3::new(12.0, 4.0, 0.0), Vec3::Z),
+        Vec::new(),
+    )];
     crate::bsp::turn_faces(&[ceiling], &mut luxels, &[(0, 1)]);
     assert!(luxels[0].receiver.normal.z > 0.9);
 }
@@ -349,6 +346,7 @@ fn construct_wall_beside_the_lamp_is_lit() {
         normal: -Vec3::Z,
         intensity: 18_000.0,
         color: Vec3::ONE,
+        reach: LAMP_REACH,
     });
     let mut receivers = wall_samples;
     receivers.push(floor);
@@ -1035,4 +1033,47 @@ fn prop_lightmaps_keep_lod0_in_file_order() {
     assert_eq!(grids[0].luxel_count, 8);
     assert_eq!(grids[1].first_luxel, 26);
     assert_eq!((grids[1].width, grids[1].height), (4, 2));
+}
+
+#[test]
+fn the_chart_matches_the_window_mix() {
+    use crate::{Image, Luxel, Material};
+    let mut shaded = Luxel::plain(receiver(Vec3::ZERO, Vec3::Z), Vec::new());
+    shaded.material = 0;
+    shaded.tex_uv = [0.5, 0.5];
+    shaded.blend = 0.25;
+    let mut bare = Luxel::plain(receiver(Vec3::ZERO, Vec3::Z), Vec::new());
+    bare.chart = [0.2, 0.3, 0.4];
+    let materials = [Material {
+        texture: Some(0),
+        texture2: Some(1),
+        detail: Some(2),
+        detail_scale: 1.0,
+        detail_factor: 1.0,
+        lightmapped: true,
+    }];
+    let images = [
+        Image {
+            width: 1,
+            height: 1,
+            mips: vec![vec![255, 0, 0, 255]],
+        },
+        Image {
+            width: 1,
+            height: 1,
+            mips: vec![vec![0, 255, 0, 255]],
+        },
+        Image {
+            width: 1,
+            height: 1,
+            mips: vec![vec![255, 255, 255, 255]],
+        },
+    ];
+    let mut luxels = vec![shaded, bare];
+    super::paint_charts(&mut luxels, &materials, &images);
+    let chart = luxels[0].chart;
+    assert!((chart[0] - 1.5).abs() < 1.0e-4, "{chart:?}");
+    assert!((chart[1] - 0.5).abs() < 1.0e-4, "{chart:?}");
+    assert!(chart[2].abs() < 1.0e-4, "{chart:?}");
+    assert_eq!(luxels[1].chart, [0.2, 0.3, 0.4]);
 }
